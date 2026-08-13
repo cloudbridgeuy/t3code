@@ -49,7 +49,11 @@ import {
   resolveExternalWebLinkHost,
   showExternalLinkContextMenu,
 } from "./chat/externalLinkContextMenu";
-import { MarkdownCodeBlock } from "./chat/MarkdownCodeBlock";
+import {
+  MarkdownCodeBlock,
+  readInitialWordWrapSetting,
+  reportMarkdownActionFailure,
+} from "./chat/MarkdownCodeBlock";
 import { MermaidBlock } from "./chat/MermaidBlock";
 import { isMermaidFence } from "./chat/mermaidBlock.logic";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
@@ -66,7 +70,6 @@ import { LRUCache } from "../lib/lruCache";
 import { getSyntaxHighlighterPromise } from "../lib/syntaxHighlighting";
 import { RenderErrorBoundary } from "./RenderErrorBoundary";
 import { useTheme } from "../hooks/useTheme";
-import { getClientSettings } from "../hooks/useSettings";
 import {
   chatMarkdownClipboardPayload,
   serializeTableElementToCsv,
@@ -117,19 +120,6 @@ const EMPTY_MARKDOWN_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "d
 const CODE_FENCE_LANGUAGE_REGEX = /(?:^|\s)language-([^\s]+)/;
 const MAX_HIGHLIGHT_CACHE_ENTRIES = 500;
 const MAX_HIGHLIGHT_CACHE_MEMORY_BYTES = 50 * 1024 * 1024;
-
-interface MarkdownActionFailureContext {
-  readonly operation: string;
-  readonly target?: string;
-  readonly format?: "markdown" | "csv";
-  readonly language?: string;
-  readonly fenceTitle?: string;
-  readonly copyTarget?: string;
-}
-
-function reportMarkdownActionFailure(context: MarkdownActionFailureContext, cause: unknown): void {
-  console.error("[chat-markdown] action failed", context, cause);
-}
 
 const highlightedCodeCache = new LRUCache<string>(
   MAX_HIGHLIGHT_CACHE_ENTRIES,
@@ -358,10 +348,6 @@ function createHighlightCacheKey(code: string, language: string, themeName: Diff
 
 function estimateHighlightedSize(html: string, code: string): number {
   return Math.max(html.length * 2, code.length * 3);
-}
-
-function readInitialWordWrapSetting(): boolean {
-  return getClientSettings().wordWrap;
 }
 
 function MarkdownTable({ children, ...props }: React.ComponentProps<"table">) {
@@ -1517,12 +1503,14 @@ function ChatMarkdown({
 
         if (isMermaidFence(language) && !isStreaming) {
           return (
-            <MermaidBlock
-              source={codeBlock.code}
-              fenceTitle={fenceTitle}
-              theme={resolvedTheme}
-              sourceView={shikiElement}
-            />
+            <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
+              <MermaidBlock
+                source={codeBlock.code}
+                fenceTitle={fenceTitle}
+                theme={resolvedTheme}
+                sourceView={shikiElement}
+              />
+            </RenderErrorBoundary>
           );
         }
 

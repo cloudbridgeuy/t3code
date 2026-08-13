@@ -10,12 +10,14 @@ import { Button } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { PierreEntryIcon } from "./PierreEntryIcon";
 
-function readInitialWordWrapSetting(): boolean {
+export function readInitialWordWrapSetting(): boolean {
   return getClientSettings().wordWrap;
 }
 
-function reportCodeBlockCopyFailure(
-  context: { operation: string; language: string; fenceTitle?: string },
+/** Shared by every markdown chrome action (copy, table export, file-link
+ * open, ...) so a failure always logs under one greppable prefix. */
+export function reportMarkdownActionFailure<T extends Record<string, unknown>>(
+  context: T,
   cause: unknown,
 ): void {
   console.error("[chat-markdown] action failed", context, cause);
@@ -109,7 +111,7 @@ export function MarkdownCodeBlock({
         }, 1200);
       })
       .catch((cause) => {
-        reportCodeBlockCopyFailure(
+        reportMarkdownActionFailure(
           {
             operation: "copy-code-block",
             language,

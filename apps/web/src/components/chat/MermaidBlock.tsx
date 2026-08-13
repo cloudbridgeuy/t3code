@@ -1,7 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 
 import { renderMermaidDiagram } from "../../lib/mermaidRenderer";
-import { resolveMermaidView, type MermaidRenderState } from "./mermaidBlock.logic";
+import {
+  mermaidFailureMessage,
+  resolveMermaidView,
+  type MermaidRenderState,
+} from "./mermaidBlock.logic";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 
 /**
@@ -35,7 +39,9 @@ export function MermaidBlock({
         }
       })
       .catch((error: unknown) => {
+        if (cancelled) return;
         console.error("[mermaid-block] failed to render diagram", error);
+        setRenderState({ status: "failed", message: mermaidFailureMessage(error) });
       });
     return () => {
       cancelled = true;
