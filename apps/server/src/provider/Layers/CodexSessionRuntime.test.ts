@@ -724,6 +724,82 @@ describe("settleCodexNotificationFromRetiredSource", () => {
       NodeAssert.equal(yield* Ref.get(syntheticEventEmitted), false);
     }),
   );
+
+  it.effect("preserves an unlineaged replacement root queued behind rebind", () =>
+    Effect.gen(function* () {
+      const sourceThreadRef = yield* Ref.make<string | undefined>("source-thread");
+      const retiredThreadIdsRef = yield* Ref.make(new Set<string>());
+      const rebindPermitHeld = yield* Deferred.make<void>();
+      const finishRebind = yield* Deferred.make<void>();
+      const handlerQueued = yield* Deferred.make<void>();
+      const interruptRequested = yield* Deferred.make<void>();
+      const liveTurns = yield* makeCodexLiveChildTurnStore();
+      const client = {
+        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+          _method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) =>
+          Deferred.succeed(interruptRequested, undefined).pipe(
+            Effect.as(
+              makeThreadOpenResponse("unused") as CodexRpc.ClientRequestResponsesByMethod[M],
+            ),
+          ),
+      };
+
+      yield* liveTurns.drainForRewind;
+      const rebind = yield* liveTurns
+        .settleBeforeRebind(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(rebindPermitHeld, undefined);
+            yield* Deferred.await(finishRebind);
+            yield* Ref.set(retiredThreadIdsRef, new Set(["source-thread"]));
+            yield* Ref.set(sourceThreadRef, "replacement-thread");
+          }),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(rebindPermitHeld);
+
+      const threadStarted = yield* Deferred.succeed(handlerQueued, undefined).pipe(
+        Effect.andThen(
+          liveTurns.withSettlementPermit(
+            settleCodexNotificationFromRetiredSource({
+              notification: {
+                _tag: "thread-started",
+                childThreadId: "replacement-thread",
+                parentThreadId: undefined,
+                spawnParentThreadId: undefined,
+              },
+              sourceThreadIdAtReceipt: "source-thread",
+              getCurrentSourceThreadId: Ref.get(sourceThreadRef),
+              retiredThreadIdsRef,
+              client,
+            }),
+          ),
+        ),
+        Effect.forkChild,
+      );
+
+      yield* Deferred.await(handlerQueued);
+      yield* Deferred.succeed(finishRebind, undefined);
+      yield* Fiber.join(rebind);
+      NodeAssert.equal(yield* Fiber.join(threadStarted), false);
+      NodeAssert.equal((yield* Ref.get(retiredThreadIdsRef)).has("replacement-thread"), false);
+
+      const turnStartedHandled = yield* settleCodexNotificationFromRetiredSource({
+        notification: {
+          _tag: "turn-started",
+          threadId: "replacement-thread",
+          turnId: "replacement-turn",
+        },
+        sourceThreadIdAtReceipt: "replacement-thread",
+        getCurrentSourceThreadId: Ref.get(sourceThreadRef),
+        retiredThreadIdsRef,
+        client,
+      });
+      NodeAssert.equal(turnStartedHandled, false);
+      NodeAssert.equal(yield* Deferred.isDone(interruptRequested), false);
+    }),
+  );
 });
 
 describe("resolveCodexRewindWaitPlan", () => {

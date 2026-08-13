@@ -1367,14 +1367,12 @@ export function settleCodexNotificationFromRetiredSource(input: {
       input.sourceThreadIdAtReceipt !== undefined &&
       currentSourceThreadId !== input.sourceThreadIdAtReceipt;
     if (input.notification._tag === "thread-started") {
-      const retiredChildThreadId = sourceChanged
-        ? input.notification.childThreadId
-        : resolveRetiredCodexChildThreadId({
-            childThreadId: input.notification.childThreadId,
-            parentThreadId: input.notification.parentThreadId,
-            spawnParentThreadId: input.notification.spawnParentThreadId,
-            retiredThreadIds,
-          });
+      const retiredChildThreadId = resolveRetiredCodexChildThreadId({
+        childThreadId: input.notification.childThreadId,
+        parentThreadId: input.notification.parentThreadId,
+        spawnParentThreadId: input.notification.spawnParentThreadId,
+        retiredThreadIds,
+      });
       if (retiredChildThreadId === undefined) {
         return false;
       }
