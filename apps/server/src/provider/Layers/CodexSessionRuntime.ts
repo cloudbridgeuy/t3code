@@ -319,27 +319,53 @@ export const makeCodexPendingRequestStore = Effect.fn("makeCodexPendingRequestSt
 export interface CodexLiveChildTurnStore {
   readonly snapshot: Effect.Effect<ReadonlyMap<string, string>>;
   readonly register: (threadId: string, turnId: string) => Effect.Effect<boolean>;
+  readonly registerAndInterrupt: (
+    threadId: string,
+    turnId: string,
+    interrupt: Effect.Effect<void>,
+  ) => Effect.Effect<void>;
+  readonly settleBeforeRebind: <A, E, R>(rebind: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   readonly remove: (threadId: string) => Effect.Effect<void>;
   readonly drainForRewind: Effect.Effect<ReadonlyMap<string, string>>;
   readonly finishRewind: Effect.Effect<void>;
 }
 
 export const makeCodexLiveChildTurnStore = Effect.fn("makeCodexLiveChildTurnStore")(function* () {
+  const settlementSemaphore = yield* Semaphore.make(1);
   const stateRef = yield* Ref.make({
     rewinding: false,
     liveTurns: new Map<string, string>(),
   });
+  const register = (threadId: string, turnId: string) =>
+    Ref.modify(stateRef, (state) => {
+      if (state.rewinding) {
+        return [true, state] as const;
+      }
+      const liveTurns = new Map(state.liveTurns);
+      liveTurns.set(threadId, turnId);
+      return [false, { ...state, liveTurns }] as const;
+    });
+  const finishRewind = Ref.update(stateRef, (state) =>
+    state.rewinding
+      ? {
+          rewinding: false,
+          liveTurns: new Map(),
+        }
+      : state,
+  );
   return {
     snapshot: Ref.get(stateRef).pipe(Effect.map((state) => state.liveTurns)),
-    register: (threadId, turnId) =>
-      Ref.modify(stateRef, (state) => {
-        if (state.rewinding) {
-          return [true, state] as const;
-        }
-        const liveTurns = new Map(state.liveTurns);
-        liveTurns.set(threadId, turnId);
-        return [false, { ...state, liveTurns }] as const;
-      }),
+    register,
+    registerAndInterrupt: (threadId, turnId, interrupt) =>
+      settlementSemaphore.withPermit(
+        register(threadId, turnId).pipe(
+          Effect.flatMap((interruptImmediately) =>
+            interruptImmediately ? interrupt : Effect.void,
+          ),
+        ),
+      ),
+    settleBeforeRebind: (rebind) =>
+      settlementSemaphore.withPermit(rebind.pipe(Effect.ensuring(finishRewind))),
     remove: (threadId) =>
       Ref.update(stateRef, (state) => {
         const liveTurns = new Map(state.liveTurns);
@@ -350,14 +376,7 @@ export const makeCodexLiveChildTurnStore = Effect.fn("makeCodexLiveChildTurnStor
       state.liveTurns,
       { rewinding: true, liveTurns: new Map() },
     ]),
-    finishRewind: Ref.update(stateRef, (state) =>
-      state.rewinding
-        ? {
-            rewinding: false,
-            liveTurns: new Map(),
-          }
-        : state,
-    ),
+    finishRewind,
   } satisfies CodexLiveChildTurnStore;
 });
 
@@ -802,7 +821,7 @@ export function isCodexTerminalThreadStatus(status: string): boolean {
 function reconcileCodexRewindSettlement(
   settlement: CodexRewindSettlement,
   thread: CodexRpc.ClientRequestResponsesByMethod["thread/read"]["thread"],
-): Effect.Effect<void> {
+): Effect.Effect<boolean> {
   const terminal = isCodexTerminalThreadStatus(thread.status.type);
   const rootSettled =
     settlement.rootTurnId === undefined ||
@@ -817,7 +836,7 @@ function reconcileCodexRewindSettlement(
         : Effect.void,
     ],
     { discard: true },
-  );
+  ).pipe(Effect.as(!terminal && !rootSettled && settlement.rootTurnId !== undefined));
 }
 
 function interruptCodexLiveTurns(
@@ -856,15 +875,11 @@ export function registerCodexLiveChildTurn(input: {
   readonly threadId: string;
   readonly turnId: string;
 }): Effect.Effect<void> {
-  return input.store
-    .register(input.threadId, input.turnId)
-    .pipe(
-      Effect.flatMap((interruptImmediately) =>
-        interruptImmediately
-          ? interruptCodexLiveTurn(input.client, input.threadId, input.turnId)
-          : Effect.void,
-      ),
-    );
+  return input.store.registerAndInterrupt(
+    input.threadId,
+    input.turnId,
+    interruptCodexLiveTurn(input.client, input.threadId, input.turnId),
+  );
 }
 
 function startCodexReplacementThread(input: {
@@ -1004,8 +1019,11 @@ export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(func
             threadId: sourceThreadId,
             includeTurns: true,
           });
-          yield* reconcileCodexRewindSettlement(settlement, reconciled.thread);
-          if (waitPlan.rootTurnId !== undefined) {
+          const interruptRoot = yield* reconcileCodexRewindSettlement(
+            settlement,
+            reconciled.thread,
+          );
+          if (interruptRoot && waitPlan.rootTurnId !== undefined) {
             yield* input.client.request("turn/interrupt", {
               threadId: sourceThreadId,
               turnId: waitPlan.rootTurnId,
@@ -1600,7 +1618,7 @@ export const makeCodexSessionRuntime = (
       state: {
         getSession: Ref.get(sessionRef),
         drainLiveChildTurnsForRewind: collabChildLiveTurns.drainForRewind,
-        finishLiveChildTurnSettlement: collabChildLiveTurns.finishRewind,
+        finishLiveChildTurnSettlement: collabChildLiveTurns.settleBeforeRebind(Effect.void),
         settlePendingRequests: settlePendingRequestsForRewind,
         finishPendingRequestSettlement: Effect.all(
           [pendingApprovals.finishRewind, pendingUserInputs.finishRewind],
@@ -1608,19 +1626,21 @@ export const makeCodexSessionRuntime = (
         ),
         threadMutationSemaphore,
         rebindProviderThread: (replacement) =>
-          Effect.gen(function* () {
-            yield* Ref.set(approvalCorrelationsRef, new Map());
-            yield* Ref.set(collabReceiverTurnsRef, new Map());
-            yield* Ref.set(collabChildAgentsRef, new Map());
-            yield* Queue.takeAll(serverNotifications);
-            yield* updateSession(sessionRef, {
-              status: "ready",
-              activeTurnId: undefined,
-              cwd: replacement.cwd,
-              model: replacement.model,
-              resumeCursor: { threadId: replacement.threadId },
-            });
-          }),
+          collabChildLiveTurns.settleBeforeRebind(
+            Effect.gen(function* () {
+              yield* Ref.set(approvalCorrelationsRef, new Map());
+              yield* Ref.set(collabReceiverTurnsRef, new Map());
+              yield* Ref.set(collabChildAgentsRef, new Map());
+              yield* Queue.takeAll(serverNotifications);
+              yield* updateSession(sessionRef, {
+                status: "ready",
+                activeTurnId: undefined,
+                cwd: replacement.cwd,
+                model: replacement.model,
+                resumeCursor: { threadId: replacement.threadId },
+              });
+            }),
+          ),
       },
     });
 

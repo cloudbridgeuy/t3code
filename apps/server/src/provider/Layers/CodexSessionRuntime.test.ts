@@ -658,16 +658,18 @@ describe("makeCodexPendingRequestStore", () => {
 });
 
 describe("makeCodexLiveChildTurnStore", () => {
-  it.effect("drains live children and marks a late child for immediate interruption", () =>
+  it.effect("waits for a late child interrupt before rebind", () =>
     Effect.gen(function* () {
       const store = yield* makeCodexLiveChildTurnStore();
-      const lateChildInterrupted = yield* Deferred.make<void>();
+      const interruptStarted = yield* Deferred.make<void>();
+      const allowInterrupt = yield* Deferred.make<void>();
+      const rebound = yield* Deferred.make<void>();
       NodeAssert.equal(yield* store.register("child-before", "turn-before"), false);
 
       NodeAssert.deepStrictEqual(Array.from((yield* store.drainForRewind).entries()), [
         ["child-before", "turn-before"],
       ]);
-      yield* registerCodexLiveChildTurn({
+      const interruptFiber = yield* registerCodexLiveChildTurn({
         store,
         threadId: "child-late",
         turnId: "turn-late",
@@ -681,23 +683,75 @@ describe("makeCodexLiveChildTurnStore", () => {
               threadId: "child-late",
               turnId: "turn-late",
             });
-            return Deferred.succeed(lateChildInterrupted, undefined).pipe(
+            return Deferred.succeed(interruptStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(allowInterrupt)),
               Effect.as(
                 makeThreadOpenResponse("unused") as CodexRpc.ClientRequestResponsesByMethod[M],
               ),
             );
           },
         },
-      });
-      yield* Deferred.await(lateChildInterrupted);
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(interruptStarted);
+      const rebindFiber = yield* store
+        .settleBeforeRebind(Deferred.succeed(rebound, undefined).pipe(Effect.asVoid))
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      NodeAssert.equal(yield* Deferred.isDone(rebound), false);
+
+      yield* Deferred.succeed(allowInterrupt, undefined);
+      yield* Fiber.join(interruptFiber);
+      yield* Fiber.join(rebindFiber);
+      yield* Deferred.await(rebound);
       NodeAssert.deepStrictEqual(Array.from((yield* store.snapshot).entries()), []);
 
-      yield* store.finishRewind;
       NodeAssert.equal(yield* store.register("child-after", "turn-after"), false);
       yield* store.finishRewind;
       NodeAssert.deepStrictEqual(Array.from((yield* store.snapshot).entries()), [
         ["child-after", "turn-after"],
       ]);
+    }),
+  );
+
+  it.effect("bounds a stuck late interrupt before rebind", () =>
+    Effect.gen(function* () {
+      const store = yield* makeCodexLiveChildTurnStore();
+      const interruptStarted = yield* Deferred.make<void>();
+      const rebound = yield* Deferred.make<void>();
+      yield* store.drainForRewind;
+      const interruptFiber = yield* registerCodexLiveChildTurn({
+        store,
+        threadId: "child-stuck",
+        turnId: "turn-stuck",
+        client: {
+          request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+            _method: M,
+            _payload: CodexRpc.ClientRequestParamsByMethod[M],
+          ) =>
+            Deferred.succeed(interruptStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+            ) as Effect.Effect<CodexRpc.ClientRequestResponsesByMethod[M]>,
+        },
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(interruptStarted);
+      const rebindFiber = yield* store
+        .settleBeforeRebind(Deferred.succeed(rebound, undefined).pipe(Effect.asVoid))
+        .pipe(Effect.forkChild);
+
+      yield* TestClock.adjust("3 seconds");
+      yield* Fiber.join(interruptFiber);
+      yield* Fiber.join(rebindFiber);
+      NodeAssert.equal(yield* Deferred.isDone(rebound), true);
+    }),
+  );
+
+  it.effect("resets the gate when rebind fails", () =>
+    Effect.gen(function* () {
+      const store = yield* makeCodexLiveChildTurnStore();
+      yield* store.drainForRewind;
+      const error = yield* store.settleBeforeRebind(Effect.fail("rebind failed")).pipe(Effect.flip);
+      NodeAssert.equal(error, "rebind failed");
+      NodeAssert.equal(yield* store.register("child-after-failure", "turn-after-failure"), false);
     }),
   );
 });
@@ -758,10 +812,10 @@ describe("makeCodexThreadRewinder", () => {
     }),
   );
 
-  it.effect("reconciles a root completion that happens before settlement registration", () =>
+  it.effect("skips root interruption when reconciliation finds it completed", () =>
     Effect.gen(function* () {
-      const rootInterruptSent = yield* Deferred.make<void>();
       let reads = 0;
+      let interrupts = 0;
       const active = makeThreadReadResponse({
         status: "active",
         turns: [{ id: "active-turn", status: "inProgress" }],
@@ -783,8 +837,12 @@ describe("makeCodexThreadRewinder", () => {
             );
           }
           if (method === "turn/interrupt") {
-            return Deferred.succeed(rootInterruptSent, undefined).pipe(
-              Effect.as(replacement as CodexRpc.ClientRequestResponsesByMethod[M]),
+            interrupts += 1;
+            return Effect.fail(
+              new CodexErrors.CodexAppServerRequestError({
+                code: -32602,
+                errorMessage: "cannot interrupt completed turn",
+              }),
             );
           }
           return Effect.succeed(replacement as CodexRpc.ClientRequestResponsesByMethod[M]);
@@ -816,12 +874,10 @@ describe("makeCodexThreadRewinder", () => {
         },
       });
 
-      const fiber = yield* rewinder.rewindThread().pipe(Effect.forkChild);
-      yield* Deferred.await(rootInterruptSent);
-      yield* Effect.yieldNow;
-      NodeAssert.notEqual(fiber.pollUnsafe(), undefined);
+      const snapshot = yield* rewinder.rewindThread();
       NodeAssert.equal(reads, 2);
-      yield* Fiber.join(fiber);
+      NodeAssert.equal(interrupts, 0);
+      NodeAssert.equal(snapshot.threadId, "replacement-thread");
     }),
   );
 
