@@ -42,6 +42,7 @@ import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
   type CodexSessionRuntimeOptions,
+  type CodexSessionRuntimeError,
   type CodexSessionRuntimeSendTurnInput,
   type CodexSessionRuntimeShape,
   type CodexThreadSnapshot,
@@ -62,6 +63,7 @@ const asItemId = (value: string): ProviderItemId => ProviderItemId.make(value);
 class FakeCodexRuntime implements CodexSessionRuntimeShape {
   private readonly eventQueue = Effect.runSync(Queue.unbounded<ProviderEvent>());
   private readonly now = "2026-01-01T00:00:00.000Z";
+  public readonly rewindLifecycleCalls: Array<"create-target" | "interrupt" | "stop"> = [];
 
   public readonly startImpl = vi.fn(() =>
     Promise.resolve({
@@ -104,7 +106,7 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
       }),
   );
 
-  public readonly rewindThreadImpl = vi.fn(
+  public readonly createRewindTargetImpl = vi.fn(
     (_lastTurnId?: TurnId): Promise<CodexThreadSnapshot> =>
       Promise.resolve({
         threadId: "provider-thread-replacement",
@@ -141,7 +143,13 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   }
 
   interruptTurn(turnId?: TurnId) {
-    return Effect.promise(() => this.interruptTurnImpl(turnId));
+    return Effect.tryPromise({
+      try: () => {
+        this.rewindLifecycleCalls.push("interrupt");
+        return this.interruptTurnImpl(turnId);
+      },
+      catch: (cause) => cause as CodexSessionRuntimeError,
+    });
   }
 
   readThread = Effect.promise(() => this.readThreadImpl());
@@ -150,8 +158,14 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Effect.promise(() => this.rollbackThreadImpl(numTurns));
   }
 
-  rewindThread(lastTurnId?: TurnId) {
-    return Effect.promise(() => this.rewindThreadImpl(lastTurnId));
+  createRewindTarget(lastTurnId?: TurnId) {
+    return Effect.tryPromise({
+      try: () => {
+        this.rewindLifecycleCalls.push("create-target");
+        return this.createRewindTargetImpl(lastTurnId);
+      },
+      catch: (cause) => cause as CodexSessionRuntimeError,
+    });
   }
 
   respondToRequest(requestId: ApprovalRequestId, decision: ProviderApprovalDecision) {
@@ -166,7 +180,10 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Stream.fromQueue(this.eventQueue);
   }
 
-  close = Effect.promise(() => this.closeImpl());
+  close = Effect.promise(() => {
+    this.rewindLifecycleCalls.push("stop");
+    return this.closeImpl();
+  });
 
   emit(event: ProviderEvent) {
     return Queue.offer(this.eventQueue, event).pipe(Effect.asVoid);
@@ -526,8 +543,10 @@ function startLifecycleRuntime() {
       runtimeMode: "full-access",
     });
     const runtime = lifecycleRuntimeFactory.lastRuntime;
+    const rewindThread = adapter.rewindThread;
     NodeAssert.ok(runtime);
-    return { adapter, runtime };
+    NodeAssert.ok(rewindThread);
+    return { adapter, rewindThread, runtime };
   });
 }
 
@@ -592,21 +611,225 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     }),
   );
 
-  it.effect("advertises and delegates conversation rewind", () =>
+  it.effect("conversation rewind creates its target before interrupting and stopping", () =>
     Effect.gen(function* () {
-      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const { adapter, rewindThread, runtime } = yield* startLifecycleRuntime();
       NodeAssert.equal(adapter.capabilities.conversationRewind, "fork");
-      NodeAssert.ok(adapter.rewindThread);
 
-      const result = yield* adapter.rewindThread(asThreadId("thread-1"), asTurnId("retained-turn"));
+      const result = yield* rewindThread(asThreadId("thread-1"), asTurnId("retained-turn"));
 
-      NodeAssert.deepStrictEqual(runtime.rewindThreadImpl.mock.calls, [
+      NodeAssert.deepStrictEqual(runtime.createRewindTargetImpl.mock.calls, [
         [asTurnId("retained-turn")],
+      ]);
+      NodeAssert.deepStrictEqual(runtime.interruptTurnImpl.mock.calls, [[undefined]]);
+      NodeAssert.deepStrictEqual(runtime.rewindLifecycleCalls, [
+        "create-target",
+        "interrupt",
+        "stop",
       ]);
       NodeAssert.equal(result.threadId, asThreadId("thread-1"));
       NodeAssert.deepStrictEqual(result.resumeCursor, {
         threadId: "provider-thread-replacement",
       });
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), false);
+    }),
+  );
+
+  it.effect("conversation rewind leaves the source active when target creation fails", () =>
+    Effect.gen(function* () {
+      const { adapter, rewindThread, runtime } = yield* startLifecycleRuntime();
+      runtime.createRewindTargetImpl.mockRejectedValueOnce(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32603,
+          errorMessage: "could not create rewind target",
+        }),
+      );
+
+      const result = yield* rewindThread(asThreadId("thread-1"), asTurnId("retained-turn")).pipe(
+        Effect.result,
+      );
+
+      NodeAssert.equal(result._tag, "Failure");
+      NodeAssert.equal(result.failure._tag, "ProviderAdapterRequestError");
+      NodeAssert.deepStrictEqual(runtime.rewindLifecycleCalls, ["create-target"]);
+      NodeAssert.equal(runtime.interruptTurnImpl.mock.calls.length, 0);
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 0);
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), true);
+    }),
+  );
+
+  it.effect("conversation rewind removes the source session before close completes", () =>
+    Effect.gen(function* () {
+      const { adapter, rewindThread, runtime } = yield* startLifecycleRuntime();
+      let signalCloseStarted: () => void = () => undefined;
+      const closeStarted = new Promise<void>((resolve) => {
+        signalCloseStarted = resolve;
+      });
+      let allowClose: () => void = () => undefined;
+      const closeGate = new Promise<undefined>((resolve) => {
+        allowClose = () => resolve(undefined);
+      });
+      runtime.closeImpl.mockImplementationOnce(() => {
+        signalCloseStarted();
+        return closeGate;
+      });
+
+      const rewindFiber = yield* rewindThread(
+        asThreadId("thread-1"),
+        asTurnId("retained-turn"),
+      ).pipe(Effect.forkChild);
+      yield* Effect.promise(() => closeStarted);
+
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), false);
+
+      allowClose();
+      yield* Fiber.join(rewindFiber);
+    }),
+  );
+
+  it.effect("conversation rewind drops late and buffered events from the stopped source", () =>
+    Effect.gen(function* () {
+      const { adapter, rewindThread, runtime: sourceRuntime } = yield* startLifecycleRuntime();
+
+      yield* sourceRuntime.emit({
+        id: asEventId("evt-rewind-source"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "process/stderr",
+        message: "stopped source event",
+      } satisfies ProviderEvent);
+      const barrierEventId = asEventId("evt-rewind-source-barrier");
+      const barrierProcessed = yield* Deferred.make<void>();
+      lifecycleRuntimeEventBarriers.set(barrierEventId, barrierProcessed);
+      yield* sourceRuntime.emit({
+        id: barrierEventId,
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "process/stderr",
+        message: "adapter FIFO barrier",
+      } satisfies ProviderEvent);
+      yield* Deferred.await(barrierProcessed);
+      lifecycleRuntimeEventBarriers.delete(barrierEventId);
+
+      yield* rewindThread(asThreadId("thread-1"), asTurnId("retained-turn"));
+      yield* sourceRuntime.emit({
+        id: asEventId("evt-rewind-source-late"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "process/stderr",
+        message: "late stopped source event",
+      } satisfies ProviderEvent);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        runtimeMode: "full-access",
+      });
+      const replacementRuntime = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(replacementRuntime);
+
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* replacementRuntime.emit({
+        id: asEventId("evt-after-rewind"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "process/stderr",
+        message: "replacement runtime event",
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some" || firstEvent.value.type !== "runtime.warning") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.payload.message, "replacement runtime event");
+    }),
+  );
+
+  it.effect("conversation rewind accepts a turn that is no longer active", () =>
+    Effect.gen(function* () {
+      const { adapter, rewindThread, runtime } = yield* startLifecycleRuntime();
+      runtime.interruptTurnImpl.mockRejectedValueOnce(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32602,
+          errorMessage: "turn is not active",
+        }),
+      );
+
+      const result = yield* rewindThread(asThreadId("thread-1"));
+
+      NodeAssert.deepStrictEqual(result.resumeCursor, {
+        threadId: "provider-thread-replacement",
+      });
+      NodeAssert.deepStrictEqual(runtime.rewindLifecycleCalls, [
+        "create-target",
+        "interrupt",
+        "stop",
+      ]);
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), false);
+    }),
+  );
+
+  it.effect("conversation rewind stops the source after an interrupt transport failure", () =>
+    Effect.gen(function* () {
+      const { adapter, rewindThread, runtime } = yield* startLifecycleRuntime();
+      runtime.interruptTurnImpl.mockRejectedValueOnce(
+        new CodexErrors.CodexAppServerTransportError({
+          operation: "read-input-stream",
+          cause: new Error("socket closed"),
+        }),
+      );
+
+      const result = yield* rewindThread(asThreadId("thread-1"), asTurnId("retained-turn")).pipe(
+        Effect.result,
+      );
+
+      NodeAssert.equal(result._tag, "Failure");
+      NodeAssert.equal(result.failure._tag, "ProviderAdapterSessionClosedError");
+      NodeAssert.deepStrictEqual(runtime.rewindLifecycleCalls, [
+        "create-target",
+        "interrupt",
+        "stop",
+      ]);
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), false);
+    }),
+  );
+
+  it.effect("conversation rewind stops the source when cancelled after target creation", () =>
+    Effect.gen(function* () {
+      const { adapter, rewindThread, runtime } = yield* startLifecycleRuntime();
+      let signalInterruptStarted: () => void = () => undefined;
+      const interruptStarted = new Promise<void>((resolve) => {
+        signalInterruptStarted = resolve;
+      });
+      const interruptGate = new Promise<undefined>(() => undefined);
+      runtime.interruptTurnImpl.mockImplementationOnce(() => {
+        signalInterruptStarted();
+        return interruptGate;
+      });
+
+      const rewindFiber = yield* rewindThread(
+        asThreadId("thread-1"),
+        asTurnId("retained-turn"),
+      ).pipe(Effect.forkChild);
+      yield* Effect.promise(() => interruptStarted);
+      yield* Fiber.interrupt(rewindFiber);
+
+      NodeAssert.deepStrictEqual(runtime.rewindLifecycleCalls, [
+        "create-target",
+        "interrupt",
+        "stop",
+      ]);
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), false);
     }),
   );
 

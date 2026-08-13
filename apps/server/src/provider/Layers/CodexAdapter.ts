@@ -57,6 +57,7 @@ import { ServerConfig } from "../../config.ts";
 import {
   CodexResumeCursorSchema,
   CodexSessionRuntimeThreadIdMissingError,
+  isCodexTurnNoLongerActiveError,
   makeCodexSessionRuntime,
   type CodexSessionRuntimeError,
   type CodexSessionRuntimeOptions,
@@ -1908,20 +1909,33 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
   };
 
-  const rewindThread: NonNullable<CodexAdapterShape["rewindThread"]> = (threadId, lastTurnId) =>
-    requireSession(threadId).pipe(
-      Effect.flatMap((session) => session.runtime.rewindThread(lastTurnId)),
-      Effect.mapError((cause) =>
-        cause._tag === "ProviderAdapterSessionNotFoundError"
-          ? cause
-          : mapCodexRuntimeError(threadId, "thread/fork", cause),
-      ),
-      Effect.map((snapshot) => ({
+  const rewindThread: NonNullable<CodexAdapterShape["rewindThread"]> = Effect.fn("rewindThread")(
+    function* (threadId, lastTurnId) {
+      const session = yield* requireSession(threadId);
+      const target = yield* session.runtime
+        .createRewindTarget(lastTurnId)
+        .pipe(Effect.mapError((cause) => mapCodexRuntimeError(threadId, "thread/fork", cause)));
+      const stopSource = Effect.gen(function* () {
+        session.eventSource.active = false;
+        yield* stopSessionInternal(session);
+      });
+      yield* session.runtime.interruptTurn().pipe(
+        Effect.catchIf(
+          (cause) =>
+            cause._tag === "CodexAppServerRequestError" && isCodexTurnNoLongerActiveError(cause),
+          () => Effect.void,
+        ),
+        Effect.mapError((cause) => mapCodexRuntimeError(threadId, "turn/interrupt", cause)),
+        Effect.ensuring(stopSource),
+      );
+
+      return {
         threadId,
-        turns: snapshot.turns,
-        resumeCursor: { threadId: snapshot.threadId },
-      })),
-    );
+        turns: target.turns,
+        resumeCursor: { threadId: target.threadId },
+      };
+    },
+  );
 
   const respondToRequest: CodexAdapterShape["respondToRequest"] = (threadId, requestId, decision) =>
     requireSession(threadId).pipe(
