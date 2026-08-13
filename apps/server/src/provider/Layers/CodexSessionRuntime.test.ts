@@ -6,19 +6,18 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
-import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import * as TestClock from "effect/testing/TestClock";
 import { describe } from "vite-plus/test";
 import {
-  DEFAULT_MODEL,
   ApprovalRequestId,
+  DEFAULT_MODEL,
   ProviderDriverKind,
-  ProviderItemId,
   type ProviderSession,
   ThreadId,
   TurnId,
@@ -39,18 +38,10 @@ import {
   hasConfiguredMcpServer,
   isCodexTurnNoLongerActiveError,
   isRecoverableThreadResumeError,
-  makeCodexApprovalDecisionEvent,
-  makeCodexPendingRequestStore,
-  makeCodexLiveChildTurnStore,
   makeCodexSessionRuntime,
-  makeCodexUserInputAnsweredEvent,
   openCodexThread,
   resolveCodexRewindPlan,
-  resolveRetiredCodexChildThreadId,
   resolveCodexTurnCompletionSessionUpdate,
-  settleCodexNotificationFromRetiredSource,
-  registerCodexLiveChildTurn,
-  toCodexUserInputAnswers,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
 
@@ -124,6 +115,54 @@ function makeThreadForkResponse(
       turns: turns.map((turn) => ({ ...turn, items: [] })),
     },
   } as unknown as CodexRpc.ClientRequestResponsesByMethod["thread/fork"];
+}
+
+function makePendingRequestPeerSource(
+  method: "item/commandExecution/requestApproval" | "item/tool/requestUserInput",
+): string {
+  const threadStartResponse = JSON.stringify(wireFixture.responses.threadStart);
+  const turnStartResponse = JSON.stringify(wireFixture.responses.turnStart);
+  const requestParams =
+    method === "item/commandExecution/requestApproval"
+      ? `{
+        threadId: threadStartResponse.thread.id,
+        turnId: turnStartResponse.turn.id,
+        itemId: "approval-item",
+        startedAtMs: 0,
+        command: "echo test"
+      }`
+      : `{
+        threadId: threadStartResponse.thread.id,
+        turnId: turnStartResponse.turn.id,
+        itemId: "structured-input-item",
+        questions: [{ id: "question", header: "Question", question: "Answer?", options: [] }]
+      }`;
+  return `#!/usr/bin/env node
+import * as readline from "node:readline";
+const threadStartResponse = ${threadStartResponse};
+const turnStartResponse = ${turnStartResponse};
+const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.method === "initialize") {
+    write({ id: message.id, result: { userAgent: "test", codexHome: "/tmp", platformFamily: "unix", platformOs: "linux" } });
+    return;
+  }
+  if (message.method === "thread/start") {
+    write({ id: message.id, result: threadStartResponse });
+    return;
+  }
+  if (message.method === "turn/start") {
+    write({ id: message.id, result: turnStartResponse });
+    write({ id: "pending-request", method: ${JSON.stringify(method)}, params: ${requestParams} });
+    return;
+  }
+  if (message.id === "pending-request") {
+    write({ method: "warning", params: { message: JSON.stringify(message.result) } });
+  }
+});
+`;
 }
 
 describe("buildTurnStartParams", () => {
@@ -281,7 +320,7 @@ describe("buildTurnStartParams", () => {
           },
         ],
       });
-    }),
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it("omits collaboration mode when interaction mode is absent", () => {
@@ -547,477 +586,275 @@ describe("resolveCodexTurnCompletionSessionUpdate", () => {
   });
 });
 
-describe("resolveRetiredCodexChildThreadId", () => {
-  const retiredThreadIds = new Set(["retired-source"]);
-
-  it("keeps an already retired child retired", () => {
-    NodeAssert.equal(
-      resolveRetiredCodexChildThreadId({
-        childThreadId: "retired-source",
-        parentThreadId: undefined,
-        spawnParentThreadId: undefined,
-        retiredThreadIds,
-      }),
-      "retired-source",
-    );
-  });
-
-  it("retires a child whose direct parent is retired", () => {
-    NodeAssert.equal(
-      resolveRetiredCodexChildThreadId({
-        childThreadId: "late-child",
-        parentThreadId: "retired-source",
-        spawnParentThreadId: undefined,
-        retiredThreadIds,
-      }),
-      "late-child",
-    );
-  });
-
-  it("retires a child whose spawn parent is retired", () => {
-    NodeAssert.equal(
-      resolveRetiredCodexChildThreadId({
-        childThreadId: "late-child",
-        parentThreadId: undefined,
-        spawnParentThreadId: "retired-source",
-        retiredThreadIds,
-      }),
-      "late-child",
-    );
-  });
-
-  it("preserves a child from the current lineage", () => {
-    NodeAssert.equal(
-      resolveRetiredCodexChildThreadId({
-        childThreadId: "current-child",
-        parentThreadId: "current-source",
-        spawnParentThreadId: "current-source",
-        retiredThreadIds,
-      }),
-      undefined,
-    );
-  });
+describe("Codex structured input responses", () => {
+  it.effect("keeps the request pending when answer validation fails", () =>
+    Effect.gen(function* () {
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const threadStartResponse = JSON.stringify(wireFixture.responses.threadStart);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const turnStartResponse = JSON.stringify(wireFixture.responses.turnStart);
+      const peerSource = `#!/usr/bin/env node
+import * as readline from "node:readline";
+const threadStartResponse = ${threadStartResponse};
+const turnStartResponse = ${turnStartResponse};
+const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.method === "initialize") {
+    write({ id: message.id, result: { userAgent: "test", codexHome: "/tmp", platformFamily: "unix", platformOs: "linux" } });
+    return;
+  }
+  if (message.method === "thread/start") {
+    write({ id: message.id, result: threadStartResponse });
+    return;
+  }
+  if (message.method === "turn/start") {
+    write({ id: message.id, result: turnStartResponse });
+    write({
+      id: "structured-input-request",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: threadStartResponse.thread.id,
+        turnId: turnStartResponse.turn.id,
+        itemId: "structured-input-item",
+        questions: [{ id: "question", header: "Question", question: "Answer?", options: [] }]
+      }
+    });
+  }
 });
-
-describe("settleCodexNotificationFromRetiredSource", () => {
-  it.effect("retires a first-seen child queued behind rebind", () =>
-    Effect.gen(function* () {
-      const sourceThreadRef = yield* Ref.make<string | undefined>("source-thread");
-      const retiredThreadIdsRef = yield* Ref.make(new Set<string>());
-      const rebindPermitHeld = yield* Deferred.make<void>();
-      const finishRebind = yield* Deferred.make<void>();
-      const handlerQueued = yield* Deferred.make<void>();
-      const interruptRequested = yield* Deferred.make<void>();
-      const liveTurns = yield* makeCodexLiveChildTurnStore();
-      const syntheticEventEmitted = yield* Ref.make(false);
-      const client = {
-        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
-          method: M,
-          payload: CodexRpc.ClientRequestParamsByMethod[M],
-        ) => {
-          NodeAssert.equal(method, "turn/interrupt");
-          NodeAssert.deepStrictEqual(payload, {
-            threadId: "late-child",
-            turnId: "late-turn",
-          });
-          return Deferred.succeed(interruptRequested, undefined).pipe(
-            Effect.andThen(Effect.never),
-            Effect.as(
-              makeThreadOpenResponse("unused") as CodexRpc.ClientRequestResponsesByMethod[M],
-            ),
-          );
-        },
-      };
-
-      yield* liveTurns.drainForRewind;
-      const rebind = yield* liveTurns
-        .settleBeforeRebind(
-          Effect.gen(function* () {
-            yield* Deferred.succeed(rebindPermitHeld, undefined);
-            yield* Deferred.await(finishRebind);
-            yield* Ref.set(retiredThreadIdsRef, new Set(["source-thread"]));
-            yield* Ref.set(sourceThreadRef, "replacement-thread");
-          }),
-        )
-        .pipe(Effect.forkChild);
-      yield* Deferred.await(rebindPermitHeld);
-
-      const threadStarted = yield* Deferred.succeed(handlerQueued, undefined).pipe(
-        Effect.andThen(
-          liveTurns.withSettlementPermit(
-            settleCodexNotificationFromRetiredSource({
-              notification: {
-                _tag: "thread-started",
-                childThreadId: "late-child",
-                parentThreadId: "source-thread",
-                spawnParentThreadId: "source-thread",
-              },
-              sourceThreadIdAtReceipt: "source-thread",
-              getCurrentSourceThreadId: Ref.get(sourceThreadRef),
-              retiredThreadIdsRef,
-              client,
-            }),
-          ),
-        ),
-        Effect.forkChild,
+`;
+      const peerDirectory = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-code-codex-structured-input-"),
+      );
+      const peerPath = NodePath.join(peerDirectory, "peer.mjs");
+      NodeFS.writeFileSync(peerPath, peerSource, { encoding: "utf8", mode: 0o755 });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(peerDirectory, { recursive: true, force: true })),
       );
 
-      yield* Deferred.await(handlerQueued);
-      yield* Deferred.succeed(finishRebind, undefined);
-      yield* Fiber.join(rebind);
-      const threadStartedHandled = yield* Fiber.join(threadStarted);
-      if (!threadStartedHandled) {
-        yield* Ref.set(syntheticEventEmitted, true);
-      }
-      NodeAssert.equal(threadStartedHandled, true);
-      NodeAssert.equal((yield* Ref.get(retiredThreadIdsRef)).has("late-child"), true);
-
-      const turnStarted = yield* settleCodexNotificationFromRetiredSource({
-        notification: {
-          _tag: "turn-started",
-          threadId: "late-child",
-          turnId: "late-turn",
-        },
-        sourceThreadIdAtReceipt: "replacement-thread",
-        getCurrentSourceThreadId: Ref.get(sourceThreadRef),
-        retiredThreadIdsRef,
-        client,
-      }).pipe(Effect.forkChild);
-      yield* Deferred.await(interruptRequested);
-      yield* TestClock.adjust("3 seconds");
-      const turnStartedHandled = yield* Fiber.join(turnStarted);
-      if (!turnStartedHandled) {
-        yield* liveTurns.register("late-child", "late-turn");
-        yield* Ref.set(syntheticEventEmitted, true);
-      }
-      NodeAssert.equal(turnStartedHandled, true);
-      NodeAssert.deepStrictEqual(Array.from((yield* liveTurns.snapshot).entries()), []);
-      NodeAssert.equal(yield* Ref.get(syntheticEventEmitted), false);
-    }),
-  );
-
-  it.effect("preserves an unlineaged replacement root queued behind rebind", () =>
-    Effect.gen(function* () {
-      const sourceThreadRef = yield* Ref.make<string | undefined>("source-thread");
-      const retiredThreadIdsRef = yield* Ref.make(new Set<string>());
-      const rebindPermitHeld = yield* Deferred.make<void>();
-      const finishRebind = yield* Deferred.make<void>();
-      const handlerQueued = yield* Deferred.make<void>();
-      const interruptRequested = yield* Deferred.make<void>();
-      const liveTurns = yield* makeCodexLiveChildTurnStore();
-      const client = {
-        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
-          _method: M,
-          _payload: CodexRpc.ClientRequestParamsByMethod[M],
-        ) =>
-          Deferred.succeed(interruptRequested, undefined).pipe(
-            Effect.as(
-              makeThreadOpenResponse("unused") as CodexRpc.ClientRequestResponsesByMethod[M],
-            ),
-          ),
-      };
-
-      yield* liveTurns.drainForRewind;
-      const rebind = yield* liveTurns
-        .settleBeforeRebind(
-          Effect.gen(function* () {
-            yield* Deferred.succeed(rebindPermitHeld, undefined);
-            yield* Deferred.await(finishRebind);
-            yield* Ref.set(retiredThreadIdsRef, new Set(["source-thread"]));
-            yield* Ref.set(sourceThreadRef, "replacement-thread");
-          }),
-        )
-        .pipe(Effect.forkChild);
-      yield* Deferred.await(rebindPermitHeld);
-
-      const threadStarted = yield* Deferred.succeed(handlerQueued, undefined).pipe(
-        Effect.andThen(
-          liveTurns.withSettlementPermit(
-            settleCodexNotificationFromRetiredSource({
-              notification: {
-                _tag: "thread-started",
-                childThreadId: "replacement-thread",
-                parentThreadId: undefined,
-                spawnParentThreadId: undefined,
-              },
-              sourceThreadIdAtReceipt: "source-thread",
-              getCurrentSourceThreadId: Ref.get(sourceThreadRef),
-              retiredThreadIdsRef,
-              client,
-            }),
-          ),
-        ),
-        Effect.forkChild,
-      );
-
-      yield* Deferred.await(handlerQueued);
-      yield* Deferred.succeed(finishRebind, undefined);
-      yield* Fiber.join(rebind);
-      NodeAssert.equal(yield* Fiber.join(threadStarted), false);
-      NodeAssert.equal((yield* Ref.get(retiredThreadIdsRef)).has("replacement-thread"), false);
-
-      const turnStartedHandled = yield* settleCodexNotificationFromRetiredSource({
-        notification: {
-          _tag: "turn-started",
-          threadId: "replacement-thread",
-          turnId: "replacement-turn",
-        },
-        sourceThreadIdAtReceipt: "replacement-thread",
-        getCurrentSourceThreadId: Ref.get(sourceThreadRef),
-        retiredThreadIdsRef,
-        client,
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("t3-thread-structured-input"),
+        binaryPath: peerPath,
+        cwd: peerDirectory,
+        runtimeMode: "full-access",
       });
-      NodeAssert.equal(turnStartedHandled, false);
-      NodeAssert.equal(yield* Deferred.isDone(interruptRequested), false);
-    }),
-  );
-});
+      yield* Effect.addFinalizer(() => runtime.close);
 
-describe("Codex pending request resolution events", () => {
-  const threadId = ThreadId.make("t3-thread");
-  const requestId = ApprovalRequestId.make("request-1");
-  const turnId = TurnId.make("turn-1");
-  const itemId = ProviderItemId.make("item-1");
+      const requestEventFiber = yield* runtime.events.pipe(
+        Stream.filter((event) => event.method === "item/tool/requestUserInput"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "request structured input" });
+      const requestEvent = Array.from(yield* Fiber.join(requestEventFiber))[0];
+      NodeAssert.ok(requestEvent?.requestId);
 
-  it("builds the canonical approval cancellation event", () => {
-    NodeAssert.deepStrictEqual(
-      makeCodexApprovalDecisionEvent({
-        threadId,
-        pending: { requestId, requestKind: "command", turnId, itemId },
-        decision: "cancel",
-      }),
-      {
-        kind: "notification",
-        threadId,
-        method: "item/requestApproval/decision",
-        requestId,
-        requestKind: "command",
-        turnId,
-        itemId,
-        payload: { requestId, requestKind: "command", decision: "cancel" },
-      },
-    );
-  });
-
-  it("builds the canonical empty structured-input answer event", () => {
-    NodeAssert.deepStrictEqual(
-      makeCodexUserInputAnsweredEvent({
-        threadId,
-        pending: { requestId, turnId, itemId },
-        answers: {},
-      }),
-      {
-        kind: "notification",
-        threadId,
-        method: "item/tool/requestUserInput/answered",
-        requestId,
-        turnId,
-        itemId,
-        payload: { answers: {} },
-      },
-    );
-  });
-});
-
-describe("makeCodexPendingRequestStore", () => {
-  it.effect("atomically drains existing requests and rejects late registration", () =>
-    Effect.gen(function* () {
-      const store = yield* makeCodexPendingRequestStore<string>();
-      const firstId = ApprovalRequestId.make("first");
-      const lateId = ApprovalRequestId.make("late");
-      NodeAssert.equal(yield* store.register(firstId, "first request"), false);
-
-      NodeAssert.deepStrictEqual(yield* store.drainForRewind, ["first request"]);
-      NodeAssert.equal(yield* store.register(lateId, "late request"), true);
-      NodeAssert.equal(yield* store.take(lateId), undefined);
-
-      yield* store.finishRewind;
-      NodeAssert.equal(yield* store.register(lateId, "after rewind"), false);
-      NodeAssert.equal(yield* store.take(lateId), "after rewind");
-    }),
-  );
-
-  it.effect("keeps a pending request when structured-input validation fails", () =>
-    Effect.gen(function* () {
-      const store = yield* makeCodexPendingRequestStore<string>();
-      const requestId = ApprovalRequestId.make("request-with-invalid-answer");
-      yield* store.register(requestId, "pending request");
-
-      const error = yield* toCodexUserInputAnswers({ question: 42 }).pipe(Effect.flip);
+      const error = yield* runtime
+        .respondToUserInput(requestEvent.requestId, { question: 42 })
+        .pipe(Effect.flip);
       NodeAssert.equal(error._tag, "CodexSessionRuntimeInvalidUserInputAnswersError");
-      NodeAssert.equal(yield* store.take(requestId), "pending request");
-    }),
+      NodeAssert.equal(error.questionId, "question");
+      yield* runtime.respondToUserInput(requestEvent.requestId, { question: "valid answer" });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
 
-describe("makeCodexLiveChildTurnStore", () => {
-  it.effect("waits for a late child interrupt before rebind", () =>
+describe("Codex pending request close ownership", () => {
+  const verifyInterruptedCloseSettles = (
+    method: "item/commandExecution/requestApproval" | "item/tool/requestUserInput",
+    expectedResponse: string,
+  ) =>
     Effect.gen(function* () {
-      const store = yield* makeCodexLiveChildTurnStore();
-      const interruptStarted = yield* Deferred.make<void>();
-      const allowInterrupt = yield* Deferred.make<void>();
-      const rebound = yield* Deferred.make<void>();
-      NodeAssert.equal(yield* store.register("child-before", "turn-before"), false);
+      const closeClaimed = yield* Deferred.make<void>();
+      const allowCloseSettlement = yield* Deferred.make<void>();
+      const requestReceived = yield* Deferred.make<void>();
+      const responseReceipt = yield* Deferred.make<string>();
+      const peerDirectory = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-code-codex-close-cancellation-"),
+      );
+      const peerPath = NodePath.join(peerDirectory, "peer.mjs");
+      NodeFS.writeFileSync(peerPath, makePendingRequestPeerSource(method), {
+        encoding: "utf8",
+        mode: 0o755,
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(peerDirectory, { recursive: true, force: true })),
+      );
 
-      NodeAssert.deepStrictEqual(Array.from((yield* store.drainForRewind).entries()), [
-        ["child-before", "turn-before"],
-      ]);
-      const interruptFiber = yield* registerCodexLiveChildTurn({
-        store,
-        threadId: "child-late",
-        turnId: "turn-late",
-        client: {
-          request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
-            method: M,
-            payload: CodexRpc.ClientRequestParamsByMethod[M],
-          ) => {
-            NodeAssert.equal(method, "turn/interrupt");
-            NodeAssert.deepStrictEqual(payload, {
-              threadId: "child-late",
-              turnId: "turn-late",
-            });
-            return Deferred.succeed(interruptStarted, undefined).pipe(
-              Effect.andThen(Deferred.await(allowInterrupt)),
-              Effect.as(
-                makeThreadOpenResponse("unused") as CodexRpc.ClientRequestResponsesByMethod[M],
-              ),
+      const runtimeScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(runtimeScope, Exit.void));
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make(`t3-thread-close-cancellation-${method}`),
+        binaryPath: peerPath,
+        cwd: peerDirectory,
+        runtimeMode: "full-access",
+        _testClosePendingRequestsGate: Deferred.succeed(closeClaimed, undefined).pipe(
+          Effect.andThen(Deferred.await(allowCloseSettlement)),
+        ),
+        _testClosePendingRequestsSettledGate: Deferred.await(responseReceipt),
+      }).pipe(Effect.provideService(Scope.Scope, runtimeScope));
+      yield* Effect.addFinalizer(() => runtime.close);
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => {
+          if (event.method === method) {
+            return Deferred.succeed(requestReceived, undefined).pipe(Effect.ignore);
+          }
+          if (event.method !== "warning") {
+            return Effect.void;
+          }
+          const message = (event.payload as { readonly message?: unknown } | undefined)?.message;
+          return typeof message === "string"
+            ? Deferred.succeed(responseReceipt, message).pipe(Effect.ignore)
+            : Effect.void;
+        }),
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "request pending input" });
+      yield* Deferred.await(requestReceived);
+
+      const closeFiber = yield* runtime.close.pipe(Effect.forkScoped);
+      yield* Deferred.await(closeClaimed);
+      const interruptorId = yield* Effect.fiberId;
+      yield* Effect.sync(() => closeFiber.interruptUnsafe(interruptorId));
+      yield* Deferred.succeed(allowCloseSettlement, undefined);
+      yield* Fiber.await(closeFiber);
+
+      NodeAssert.equal(yield* Deferred.isDone(responseReceipt), true);
+      NodeAssert.equal(yield* Deferred.await(responseReceipt), expectedResponse);
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+  it.effect("prevents an approval response after close claims the request", () =>
+    Effect.gen(function* () {
+      const closeClaimed = yield* Deferred.make<void>();
+      const allowCloseSettlement = yield* Deferred.make<void>();
+      const peerDirectory = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-code-codex-close-approval-"),
+      );
+      const peerPath = NodePath.join(peerDirectory, "peer.mjs");
+      NodeFS.writeFileSync(
+        peerPath,
+        makePendingRequestPeerSource("item/commandExecution/requestApproval"),
+        { encoding: "utf8", mode: 0o755 },
+      );
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(peerDirectory, { recursive: true, force: true })),
+      );
+
+      const runtimeScope = yield* Scope.make();
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("t3-thread-close-approval"),
+        binaryPath: peerPath,
+        cwd: peerDirectory,
+        runtimeMode: "full-access",
+        _testClosePendingRequestsGate: Deferred.succeed(closeClaimed, undefined).pipe(
+          Effect.andThen(Deferred.await(allowCloseSettlement)),
+        ),
+      }).pipe(Effect.provideService(Scope.Scope, runtimeScope));
+      yield* Effect.addFinalizer(() => runtime.close);
+      const requestEventReady = yield* Deferred.make<{ readonly requestId: string }>();
+      const responseAccepted = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => {
+          if (event.method === "item/commandExecution/requestApproval" && event.requestId) {
+            return Deferred.succeed(requestEventReady, { requestId: event.requestId }).pipe(
+              Effect.ignore,
             );
-          },
-        },
-      }).pipe(Effect.forkChild);
-      yield* Deferred.await(interruptStarted);
-      const rebindFiber = yield* store
-        .settleBeforeRebind(Deferred.succeed(rebound, undefined).pipe(Effect.asVoid))
-        .pipe(Effect.forkChild);
-      yield* Effect.yieldNow;
-      NodeAssert.equal(yield* Deferred.isDone(rebound), false);
+          }
+          return event.method === "item/requestApproval/decision"
+            ? Deferred.succeed(responseAccepted, undefined).pipe(Effect.ignore)
+            : Effect.void;
+        }),
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "request approval" });
+      const requestEvent = yield* Deferred.await(requestEventReady);
 
-      yield* Deferred.succeed(allowInterrupt, undefined);
-      yield* Fiber.join(interruptFiber);
-      yield* Fiber.join(rebindFiber);
-      yield* Deferred.await(rebound);
-      NodeAssert.deepStrictEqual(Array.from((yield* store.snapshot).entries()), []);
+      const closeFiber = yield* runtime.close.pipe(Effect.forkScoped);
 
-      NodeAssert.equal(yield* store.register("child-after", "turn-after"), false);
-      yield* store.finishRewind;
-      NodeAssert.deepStrictEqual(Array.from((yield* store.snapshot).entries()), [
-        ["child-after", "turn-after"],
-      ]);
-    }),
+      yield* Deferred.await(closeClaimed);
+      const error = yield* runtime
+        .respondToRequest(ApprovalRequestId.make(requestEvent.requestId), "accept")
+        .pipe(Effect.flip);
+      NodeAssert.equal(error._tag, "CodexSessionRuntimePendingApprovalNotFoundError");
+      NodeAssert.equal(yield* Deferred.isDone(responseAccepted), false);
+      yield* Deferred.succeed(allowCloseSettlement, undefined);
+      yield* Fiber.join(closeFiber);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("bounds a stuck late interrupt before rebind", () =>
+  it.effect("prevents a structured-input response after close claims the request", () =>
     Effect.gen(function* () {
-      const store = yield* makeCodexLiveChildTurnStore();
-      const interruptStarted = yield* Deferred.make<void>();
-      const rebound = yield* Deferred.make<void>();
-      yield* store.drainForRewind;
-      const interruptFiber = yield* registerCodexLiveChildTurn({
-        store,
-        threadId: "child-stuck",
-        turnId: "turn-stuck",
-        client: {
-          request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
-            _method: M,
-            _payload: CodexRpc.ClientRequestParamsByMethod[M],
-          ) =>
-            Deferred.succeed(interruptStarted, undefined).pipe(
-              Effect.andThen(Effect.never),
-            ) as Effect.Effect<CodexRpc.ClientRequestResponsesByMethod[M]>,
-        },
-      }).pipe(Effect.forkChild);
-      yield* Deferred.await(interruptStarted);
-      const rebindFiber = yield* store
-        .settleBeforeRebind(Deferred.succeed(rebound, undefined).pipe(Effect.asVoid))
-        .pipe(Effect.forkChild);
+      const closeClaimed = yield* Deferred.make<void>();
+      const allowCloseSettlement = yield* Deferred.make<void>();
+      const peerDirectory = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-code-codex-close-user-input-"),
+      );
+      const peerPath = NodePath.join(peerDirectory, "peer.mjs");
+      NodeFS.writeFileSync(peerPath, makePendingRequestPeerSource("item/tool/requestUserInput"), {
+        encoding: "utf8",
+        mode: 0o755,
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(peerDirectory, { recursive: true, force: true })),
+      );
 
-      yield* TestClock.adjust("3 seconds");
-      yield* Fiber.join(interruptFiber);
-      yield* Fiber.join(rebindFiber);
-      NodeAssert.equal(yield* Deferred.isDone(rebound), true);
-    }),
+      const runtimeScope = yield* Scope.make();
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("t3-thread-close-user-input"),
+        binaryPath: peerPath,
+        cwd: peerDirectory,
+        runtimeMode: "full-access",
+        _testClosePendingRequestsGate: Deferred.succeed(closeClaimed, undefined).pipe(
+          Effect.andThen(Deferred.await(allowCloseSettlement)),
+        ),
+      }).pipe(Effect.provideService(Scope.Scope, runtimeScope));
+      yield* Effect.addFinalizer(() => runtime.close);
+      const requestEventReady = yield* Deferred.make<{ readonly requestId: string }>();
+      const responseAccepted = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => {
+          if (event.method === "item/tool/requestUserInput" && event.requestId) {
+            return Deferred.succeed(requestEventReady, { requestId: event.requestId }).pipe(
+              Effect.ignore,
+            );
+          }
+          return event.method === "item/tool/requestUserInput/answered"
+            ? Deferred.succeed(responseAccepted, undefined).pipe(Effect.ignore)
+            : Effect.void;
+        }),
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "request structured input" });
+      const requestEvent = yield* Deferred.await(requestEventReady);
+
+      const closeFiber = yield* runtime.close.pipe(Effect.forkScoped);
+
+      yield* Deferred.await(closeClaimed);
+      const error = yield* runtime
+        .respondToUserInput(ApprovalRequestId.make(requestEvent.requestId), {
+          question: "late answer",
+        })
+        .pipe(Effect.flip);
+      NodeAssert.equal(error._tag, "CodexSessionRuntimePendingUserInputNotFoundError");
+      NodeAssert.equal(yield* Deferred.isDone(responseAccepted), false);
+      yield* Deferred.succeed(allowCloseSettlement, undefined);
+      yield* Fiber.join(closeFiber);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("resets the gate when rebind fails", () =>
-    Effect.gen(function* () {
-      const store = yield* makeCodexLiveChildTurnStore();
-      yield* store.drainForRewind;
-      const error = yield* store.settleBeforeRebind(Effect.fail("rebind failed")).pipe(Effect.flip);
-      NodeAssert.equal(error, "rebind failed");
-      NodeAssert.equal(yield* store.register("child-after-failure", "turn-after-failure"), false);
-    }),
+  it.effect("settles a drained approval when close is interrupted", () =>
+    verifyInterruptedCloseSettles("item/commandExecution/requestApproval", '{"decision":"cancel"}'),
   );
 
-  it.effect("rejects an old-source child queued behind rebind", () =>
-    Effect.gen(function* () {
-      const store = yield* makeCodexLiveChildTurnStore();
-      const sourceThreadRef = yield* Ref.make("source-thread");
-      const rebindPermitHeld = yield* Deferred.make<void>();
-      const finishRebind = yield* Deferred.make<void>();
-      const registrationAttempted = yield* Deferred.make<void>();
-      const interruptRequested = yield* Deferred.make<void>();
-      const syntheticEventEmitted = yield* Ref.make(false);
-      yield* store.drainForRewind;
-      const rebind = yield* store
-        .settleBeforeRebind(
-          Effect.gen(function* () {
-            yield* Deferred.succeed(rebindPermitHeld, undefined);
-            yield* Deferred.await(finishRebind);
-            yield* Ref.set(sourceThreadRef, "replacement-thread");
-          }),
-        )
-        .pipe(Effect.forkChild);
-      yield* Deferred.await(rebindPermitHeld);
-
-      const instrumentedStore = {
-        ...store,
-        registerAndInterrupt: (...args: Parameters<typeof store.registerAndInterrupt>) =>
-          Deferred.succeed(registrationAttempted, undefined).pipe(
-            Effect.andThen(store.registerAndInterrupt(...args)),
-          ),
-      };
-      const handler = yield* Effect.gen(function* () {
-        const sourceThreadIdAtReceipt = yield* Ref.get(sourceThreadRef);
-        const currentSource = yield* registerCodexLiveChildTurn({
-          store: instrumentedStore,
-          threadId: "old-child-thread",
-          turnId: "old-child-turn",
-          sourceThreadIdAtReceipt,
-          getCurrentSourceThreadId: Ref.get(sourceThreadRef),
-          client: {
-            request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
-              method: M,
-              payload: CodexRpc.ClientRequestParamsByMethod[M],
-            ) => {
-              NodeAssert.equal(method, "turn/interrupt");
-              NodeAssert.deepStrictEqual(payload, {
-                threadId: "old-child-thread",
-                turnId: "old-child-turn",
-              });
-              return Deferred.succeed(interruptRequested, undefined).pipe(
-                Effect.andThen(Effect.never),
-                Effect.as(
-                  makeThreadOpenResponse("unused") as CodexRpc.ClientRequestResponsesByMethod[M],
-                ),
-              );
-            },
-          },
-        });
-        if (currentSource) {
-          yield* Ref.set(syntheticEventEmitted, true);
-        }
-      }).pipe(Effect.forkChild);
-
-      yield* Deferred.await(registrationAttempted);
-      NodeAssert.equal(yield* Deferred.isDone(interruptRequested), false);
-      yield* Deferred.succeed(finishRebind, undefined);
-      yield* Fiber.join(rebind);
-      yield* Deferred.await(interruptRequested);
-      yield* TestClock.adjust("3 seconds");
-      yield* Fiber.join(handler);
-      NodeAssert.equal(yield* Ref.get(syntheticEventEmitted), false);
-      NodeAssert.deepStrictEqual(Array.from((yield* store.snapshot).entries()), []);
-    }),
+  it.effect("settles drained structured input when close is interrupted", () =>
+    verifyInterruptedCloseSettles("item/tool/requestUserInput", '{"answers":{}}'),
   );
 });
 
@@ -1071,6 +908,7 @@ describe("createCodexRewindTarget", () => {
         NodePath.join(NodeOS.tmpdir(), "t3-code-codex-rewind-target-"),
       );
       const scriptPath = NodePath.join(scriptDirectory, "script.json");
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
       NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => NodeFS.rmSync(scriptDirectory, { recursive: true, force: true })),
@@ -1110,8 +948,7 @@ describe("createCodexRewindTarget", () => {
       NodeAssert.deepStrictEqual(sessionAfterTargetRpc, sourceSession);
 
       // The mock peer flushes this async replacement thread/started after the
-      // target RPC resolves. A runtime that rebinds to the target would accept
-      // the notification and replace the source cursor.
+      // target RPC resolves. Target creation must keep the source cursor.
       yield* runtime.sendTurn({ input: "flush target thread/started" });
       yield* Fiber.join(targetThreadStartedDelivered);
       const sessionAfterTargetNotification = yield* runtime.getSession;
@@ -1215,7 +1052,7 @@ describe("createCodexRewindTarget", () => {
     }),
   );
 
-  it.effect("rejects an invalid retained turn before interruption", () =>
+  it.effect("rejects an invalid retained turn before target creation", () =>
     Effect.gen(function* () {
       const calls: Array<string> = [];
       const source = makeThreadReadResponse({ status: "idle", turns: [] });

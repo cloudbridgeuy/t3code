@@ -13,8 +13,7 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { type ProviderEvent, ThreadId } from "@t3tools/contracts";
-import * as Deferred from "effect/Deferred";
+import { ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
@@ -144,132 +143,6 @@ describe("CodexSessionRuntime collab integration", () => {
         "child thread/* lifecycle must not appear as parent events",
       );
 
-      yield* runtime.close;
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
-
-  it.live("suppresses retired child notifications delivered after rebind", () =>
-    Effect.gen(function* () {
-      const sourceTurnId = "019fe3f0-0000-7000-8000-000000000001";
-      const replacementTurnId = "019fe3f0-0000-7000-8000-000000000002";
-      const replacementThreadId = "019fe3f0-0000-7000-8000-000000000003";
-      const registrationB = wireFixture.notifications.find(
-        (entry) =>
-          entry.method === "item/completed" &&
-          (entry.params as { item?: { agentThreadId?: string } }).item?.agentThreadId === CHILD_B,
-      );
-      const rootThreadStarted = wireFixture.notifications.find(
-        (entry) => entry.method === "thread/started",
-      );
-      const childATurnStarted = wireFixture.notifications.find(
-        (entry) =>
-          entry.method === "turn/started" &&
-          (entry.params as { threadId?: string }).threadId === CHILD_A,
-      );
-      assert.isDefined(registrationB);
-      assert.isDefined(rootThreadStarted);
-      assert.isDefined(childATurnStarted);
-
-      const lateChildThreadStarted = {
-        ...rootThreadStarted,
-        params: {
-          thread: {
-            ...rootThreadStarted.params.thread,
-            id: CHILD_A,
-            sessionId: CHILD_A,
-            parentThreadId: ROOT,
-            source: {
-              subAgent: {
-                thread_spawn: {
-                  agent_nickname: "alpha",
-                  agent_path: "/root/alpha",
-                  depth: 1,
-                  parent_thread_id: ROOT,
-                },
-              },
-            },
-          },
-        },
-      };
-      const lateChildTurnStarted = {
-        ...childATurnStarted,
-        params: {
-          ...childATurnStarted.params,
-          turn: {
-            ...childATurnStarted.params.turn,
-            id: "019fe3f0-0000-7000-8000-000000000004",
-          },
-        },
-      };
-      const script = {
-        rootThreadId: ROOT,
-        replacementThreadId,
-        turnIds: [sourceTurnId, replacementTurnId],
-        notifications: [],
-        notificationsByTurnStart: [[registrationB], [lateChildThreadStarted, lateChildTurnStarted]],
-      };
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
-      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
-      const interruptsPath = `${scriptPath}.interrupts`;
-      NodeFS.rmSync(interruptsPath, { force: true });
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          NodeFS.rmSync(scriptPath, { force: true });
-          NodeFS.rmSync(interruptsPath, { force: true });
-        }),
-      );
-
-      const runtime = yield* makeCodexSessionRuntime({
-        threadId: ThreadId.make("thread-codex-retired-notifications"),
-        binaryPath: peerPath,
-        cwd: "/tmp",
-        runtimeMode: "full-access",
-        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
-      });
-      const sourceCompleted = yield* Deferred.make<void>();
-      const replacementCompleted = yield* Deferred.make<void>();
-      const events: Array<ProviderEvent> = [];
-      const eventsFiber = yield* runtime.events.pipe(
-        Stream.runForEach((event) =>
-          Effect.sync(() => events.push(event)).pipe(
-            Effect.andThen(
-              event.method === "turn/completed" && event.turnId === sourceTurnId
-                ? Deferred.succeed(sourceCompleted, undefined)
-                : event.method === "turn/completed" && event.turnId === replacementTurnId
-                  ? Deferred.succeed(replacementCompleted, undefined)
-                  : Effect.void,
-            ),
-          ),
-        ),
-        Effect.forkScoped,
-      );
-
-      yield* runtime.start();
-      yield* runtime.sendTurn({ input: "register source children" });
-      yield* Deferred.await(sourceCompleted);
-      yield* runtime.rewindThread();
-      yield* runtime.sendTurn({ input: "deliver old notifications after rebind" });
-      yield* Deferred.await(replacementCompleted);
-
-      const staleSyntheticEvents = events.filter((event) => {
-        const agentThreadId = (event.payload as { agentThreadId?: string } | undefined)
-          ?.agentThreadId;
-        return (
-          (event.method === "collabAgent/started" && agentThreadId === CHILD_A) ||
-          (event.method === "collabAgent/turnStarted" && agentThreadId === CHILD_A)
-        );
-      });
-      assert.deepEqual(staleSyntheticEvents, []);
-      const interrupts = NodeFS.readFileSync(interruptsPath, "utf8")
-        .trim()
-        .split("\n")
-        .filter((line) => line.length > 0)
-        .map((line) => JSON.parse(line) as { threadId?: string; turnId?: string });
-      assert.includeDeepMembers(interrupts, [
-        { threadId: CHILD_A, turnId: lateChildTurnStarted.params.turn.id },
-      ]);
-
-      yield* Fiber.interrupt(eventsFiber);
       yield* runtime.close;
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
