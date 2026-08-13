@@ -85,12 +85,23 @@ export interface CodexAdapterLiveOptions {
   >;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly onRuntimeEventProcessed?: (event: ProviderEvent) => Effect.Effect<void>;
+}
+
+interface CodexAdapterEventSource {
+  active: boolean;
+}
+
+interface CodexAdapterRuntimeEventEnvelope {
+  readonly event: ProviderRuntimeEvent;
+  readonly source: CodexAdapterEventSource;
 }
 
 interface CodexAdapterSessionContext {
   readonly threadId: ThreadId;
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
+  readonly eventSource: CodexAdapterEventSource;
   readonly eventFiber: Fiber.Fiber<void, never>;
   stopped: boolean;
 }
@@ -1639,7 +1650,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       : undefined);
   const managedNativeEventLogger =
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
-  const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventQueue = yield* Queue.unbounded<CodexAdapterRuntimeEventEnvelope>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
@@ -1655,6 +1666,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
         const existing = sessions.get(input.threadId);
         if (existing && !existing.stopped) {
+          existing.eventSource.active = false;
           yield* Effect.suspend(() => stopSessionInternal(existing));
         }
 
@@ -1715,6 +1727,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
+        const eventSource: CodexAdapterEventSource = { active: true };
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
@@ -1728,7 +1741,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               });
               return;
             }
-            yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
+            yield* Queue.offerAll(
+              runtimeEventQueue,
+              runtimeEvents.map((runtimeEvent) => ({ event: runtimeEvent, source: eventSource })),
+            );
+            yield* options?.onRuntimeEventProcessed?.(event) ?? Effect.void;
           }),
         ).pipe(Effect.forkChild);
 
@@ -1755,6 +1772,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           threadId: input.threadId,
           scope: sessionScope,
           runtime,
+          eventSource,
           eventFiber,
           stopped: false,
         });
@@ -2001,7 +2019,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     hasSession,
     stopAll,
     get streamEvents() {
-      return Stream.fromQueue(runtimeEventQueue);
+      return Stream.fromQueue(runtimeEventQueue).pipe(
+        Stream.filter((envelope) => envelope.source.active),
+        Stream.map((envelope) => envelope.event),
+      );
     },
   } satisfies CodexAdapterShape;
 });

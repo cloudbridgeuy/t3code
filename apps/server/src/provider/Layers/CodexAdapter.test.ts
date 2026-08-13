@@ -23,6 +23,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -492,6 +493,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
 });
 
 const lifecycleRuntimeFactory = makeRuntimeFactory();
+const lifecycleRuntimeEventBarriers = new Map<EventId, Deferred.Deferred<void>>();
 const lifecycleLayer = it.layer(
   Layer.effect(
     CodexAdapter,
@@ -499,6 +501,12 @@ const lifecycleLayer = it.layer(
       const codexConfig = decodeCodexSettings({});
       return yield* makeCodexAdapter(codexConfig, {
         makeRuntime: lifecycleRuntimeFactory.factory,
+        onRuntimeEventProcessed: (event) => {
+          const processed = lifecycleRuntimeEventBarriers.get(event.id);
+          return processed
+            ? Deferred.succeed(processed, undefined).pipe(Effect.asVoid)
+            : Effect.void;
+        },
       });
     }),
   ).pipe(
@@ -524,6 +532,66 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("drops buffered events from a superseded runtime", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime: supersededRuntime } = yield* startLifecycleRuntime();
+
+      yield* supersededRuntime.emit({
+        id: asEventId("evt-superseded-runtime"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "process/stderr",
+        message: "superseded runtime event",
+      } satisfies ProviderEvent);
+      const barrierEventId = asEventId("evt-superseded-runtime-barrier");
+      const barrierProcessed = yield* Deferred.make<void>();
+      lifecycleRuntimeEventBarriers.set(barrierEventId, barrierProcessed);
+      yield* supersededRuntime.emit({
+        id: barrierEventId,
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "process/stderr",
+        message: "adapter FIFO barrier",
+      } satisfies ProviderEvent);
+      yield* Deferred.await(barrierProcessed);
+      lifecycleRuntimeEventBarriers.delete(barrierEventId);
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        runtimeMode: "full-access",
+      });
+      const currentRuntime = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(currentRuntime);
+
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* currentRuntime.emit({
+        id: asEventId("evt-current-runtime"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "process/stderr",
+        message: "current runtime event",
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.type, "runtime.warning");
+      if (firstEvent.value.type !== "runtime.warning") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.payload.message, "current runtime event");
+    }),
+  );
+
   it.effect("advertises and delegates conversation rewind", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();
