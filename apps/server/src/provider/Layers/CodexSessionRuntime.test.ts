@@ -45,6 +45,7 @@ import {
   resolveCodexRewindWaitPlan,
   resolveRetiredCodexChildThreadId,
   resolveCodexTurnCompletionSessionUpdate,
+  settleCodexNotificationFromRetiredSource,
   registerCodexLiveChildTurn,
   toCodexUserInputAnswers,
 } from "./CodexSessionRuntime.ts";
@@ -625,6 +626,104 @@ describe("resolveRetiredCodexChildThreadId", () => {
       undefined,
     );
   });
+});
+
+describe("settleCodexNotificationFromRetiredSource", () => {
+  it.effect("retires a first-seen child queued behind rebind", () =>
+    Effect.gen(function* () {
+      const sourceThreadRef = yield* Ref.make<string | undefined>("source-thread");
+      const retiredThreadIdsRef = yield* Ref.make(new Set<string>());
+      const rebindPermitHeld = yield* Deferred.make<void>();
+      const finishRebind = yield* Deferred.make<void>();
+      const handlerQueued = yield* Deferred.make<void>();
+      const interruptRequested = yield* Deferred.make<void>();
+      const liveTurns = yield* makeCodexLiveChildTurnStore();
+      const syntheticEventEmitted = yield* Ref.make(false);
+      const client = {
+        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+          method: M,
+          payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          NodeAssert.equal(method, "turn/interrupt");
+          NodeAssert.deepStrictEqual(payload, {
+            threadId: "late-child",
+            turnId: "late-turn",
+          });
+          return Deferred.succeed(interruptRequested, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.as(
+              makeThreadOpenResponse("unused") as CodexRpc.ClientRequestResponsesByMethod[M],
+            ),
+          );
+        },
+      };
+
+      yield* liveTurns.drainForRewind;
+      const rebind = yield* liveTurns
+        .settleBeforeRebind(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(rebindPermitHeld, undefined);
+            yield* Deferred.await(finishRebind);
+            yield* Ref.set(retiredThreadIdsRef, new Set(["source-thread"]));
+            yield* Ref.set(sourceThreadRef, "replacement-thread");
+          }),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(rebindPermitHeld);
+
+      const threadStarted = yield* Deferred.succeed(handlerQueued, undefined).pipe(
+        Effect.andThen(
+          liveTurns.withSettlementPermit(
+            settleCodexNotificationFromRetiredSource({
+              notification: {
+                _tag: "thread-started",
+                childThreadId: "late-child",
+                parentThreadId: "source-thread",
+                spawnParentThreadId: "source-thread",
+              },
+              sourceThreadIdAtReceipt: "source-thread",
+              getCurrentSourceThreadId: Ref.get(sourceThreadRef),
+              retiredThreadIdsRef,
+              client,
+            }),
+          ),
+        ),
+        Effect.forkChild,
+      );
+
+      yield* Deferred.await(handlerQueued);
+      yield* Deferred.succeed(finishRebind, undefined);
+      yield* Fiber.join(rebind);
+      const threadStartedHandled = yield* Fiber.join(threadStarted);
+      if (!threadStartedHandled) {
+        yield* Ref.set(syntheticEventEmitted, true);
+      }
+      NodeAssert.equal(threadStartedHandled, true);
+      NodeAssert.equal((yield* Ref.get(retiredThreadIdsRef)).has("late-child"), true);
+
+      const turnStarted = yield* settleCodexNotificationFromRetiredSource({
+        notification: {
+          _tag: "turn-started",
+          threadId: "late-child",
+          turnId: "late-turn",
+        },
+        sourceThreadIdAtReceipt: "replacement-thread",
+        getCurrentSourceThreadId: Ref.get(sourceThreadRef),
+        retiredThreadIdsRef,
+        client,
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(interruptRequested);
+      yield* TestClock.adjust("3 seconds");
+      const turnStartedHandled = yield* Fiber.join(turnStarted);
+      if (!turnStartedHandled) {
+        yield* liveTurns.register("late-child", "late-turn");
+        yield* Ref.set(syntheticEventEmitted, true);
+      }
+      NodeAssert.equal(turnStartedHandled, true);
+      NodeAssert.deepStrictEqual(Array.from((yield* liveTurns.snapshot).entries()), []);
+      NodeAssert.equal(yield* Ref.get(syntheticEventEmitted), false);
+    }),
+  );
 });
 
 describe("resolveCodexRewindWaitPlan", () => {

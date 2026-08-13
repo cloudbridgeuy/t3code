@@ -326,6 +326,9 @@ export interface CodexLiveChildTurnStore {
     sourceIsCurrent: Effect.Effect<boolean>,
   ) => Effect.Effect<boolean>;
   readonly settleBeforeRebind: <A, E, R>(rebind: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+  readonly withSettlementPermit: <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E, R>;
   readonly remove: (threadId: string) => Effect.Effect<void>;
   readonly drainForRewind: Effect.Effect<ReadonlyMap<string, string>>;
   readonly finishRewind: Effect.Effect<void>;
@@ -354,11 +357,13 @@ export const makeCodexLiveChildTurnStore = Effect.fn("makeCodexLiveChildTurnStor
         }
       : state,
   );
+  const withSettlementPermit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    settlementSemaphore.withPermit(effect);
   return {
     snapshot: Ref.get(stateRef).pipe(Effect.map((state) => state.liveTurns)),
     register,
     registerAndInterrupt: (threadId, turnId, interrupt, sourceIsCurrent) =>
-      settlementSemaphore.withPermit(
+      withSettlementPermit(
         Effect.gen(function* () {
           if (!(yield* sourceIsCurrent)) {
             yield* interrupt;
@@ -371,7 +376,8 @@ export const makeCodexLiveChildTurnStore = Effect.fn("makeCodexLiveChildTurnStor
         }),
       ),
     settleBeforeRebind: (rebind) =>
-      settlementSemaphore.withPermit(rebind.pipe(Effect.ensuring(finishRewind))),
+      withSettlementPermit(rebind.pipe(Effect.ensuring(finishRewind))),
+    withSettlementPermit,
     remove: (threadId) =>
       Ref.update(stateRef, (state) => {
         const liveTurns = new Map(state.liveTurns);
@@ -1336,6 +1342,61 @@ export function resolveRetiredCodexChildThreadId(input: {
     : undefined;
 }
 
+export function settleCodexNotificationFromRetiredSource(input: {
+  readonly notification:
+    | {
+        readonly _tag: "thread-started";
+        readonly childThreadId: string;
+        readonly parentThreadId: string | undefined;
+        readonly spawnParentThreadId: string | undefined;
+      }
+    | {
+        readonly _tag: "turn-started";
+        readonly threadId: string;
+        readonly turnId: string;
+      };
+  readonly sourceThreadIdAtReceipt: string | undefined;
+  readonly getCurrentSourceThreadId: Effect.Effect<string | undefined>;
+  readonly retiredThreadIdsRef: Ref.Ref<Set<string>>;
+  readonly client: CodexThreadRewindClient;
+}): Effect.Effect<boolean> {
+  return Effect.gen(function* () {
+    const currentSourceThreadId = yield* input.getCurrentSourceThreadId;
+    const retiredThreadIds = yield* Ref.get(input.retiredThreadIdsRef);
+    const sourceChanged =
+      input.sourceThreadIdAtReceipt !== undefined &&
+      currentSourceThreadId !== input.sourceThreadIdAtReceipt;
+    if (input.notification._tag === "thread-started") {
+      const retiredChildThreadId = sourceChanged
+        ? input.notification.childThreadId
+        : resolveRetiredCodexChildThreadId({
+            childThreadId: input.notification.childThreadId,
+            parentThreadId: input.notification.parentThreadId,
+            spawnParentThreadId: input.notification.spawnParentThreadId,
+            retiredThreadIds,
+          });
+      if (retiredChildThreadId === undefined) {
+        return false;
+      }
+      yield* Ref.update(input.retiredThreadIdsRef, (current) => {
+        const next = new Set(current);
+        next.add(retiredChildThreadId);
+        return next;
+      });
+      return true;
+    }
+    if (!sourceChanged && !retiredThreadIds.has(input.notification.threadId)) {
+      return false;
+    }
+    yield* interruptCodexLiveTurn(
+      input.client,
+      input.notification.threadId,
+      input.notification.turnId,
+    );
+    return true;
+  });
+}
+
 function rememberCollabReceiverTurns(
   collabReceiverTurns: Map<string, TurnId>,
   notification: CodexServerNotification,
@@ -2041,36 +2102,40 @@ export const makeCodexSessionRuntime = (
         }
       });
 
-    const handleRawNotification = (notification: CodexServerNotification) =>
+    const handleRawNotificationWithReceiptSource = (
+      notification: CodexServerNotification,
+      sourceThreadIdAtReceipt: string | undefined,
+    ) =>
       Effect.gen(function* () {
-        const sourceThreadIdAtReceipt = currentProviderThreadId(yield* Ref.get(sessionRef));
         const providerConversationId = readNotificationThreadId(notification);
-        const retiredThreadIds = yield* Ref.get(retiredProviderThreadIdsRef);
-        if (notification.method === "thread/started") {
-          const retiredChildThreadId = resolveRetiredCodexChildThreadId({
-            childThreadId: notification.params.thread.id,
-            parentThreadId: notification.params.thread.parentThreadId ?? undefined,
-            spawnParentThreadId:
-              readThreadSpawnSource(notification.params.thread)?.parentThreadId ?? undefined,
-            retiredThreadIds,
+        if (notification.method === "thread/started" || notification.method === "turn/started") {
+          const handled = yield* settleCodexNotificationFromRetiredSource({
+            notification:
+              notification.method === "thread/started"
+                ? {
+                    _tag: "thread-started" as const,
+                    childThreadId: notification.params.thread.id,
+                    parentThreadId: notification.params.thread.parentThreadId ?? undefined,
+                    spawnParentThreadId:
+                      readThreadSpawnSource(notification.params.thread)?.parentThreadId ??
+                      undefined,
+                  }
+                : {
+                    _tag: "turn-started" as const,
+                    threadId: notification.params.threadId,
+                    turnId: notification.params.turn.id,
+                  },
+            sourceThreadIdAtReceipt,
+            getCurrentSourceThreadId: Ref.get(sessionRef).pipe(Effect.map(currentProviderThreadId)),
+            retiredThreadIdsRef: retiredProviderThreadIdsRef,
+            client,
           });
-          if (retiredChildThreadId !== undefined) {
-            yield* Ref.update(retiredProviderThreadIdsRef, (current) => {
-              const next = new Set(current);
-              next.add(retiredChildThreadId);
-              return next;
-            });
+          if (handled) {
             return;
           }
         }
+        const retiredThreadIds = yield* Ref.get(retiredProviderThreadIdsRef);
         if (providerConversationId !== undefined && retiredThreadIds.has(providerConversationId)) {
-          if (notification.method === "turn/started") {
-            yield* interruptCodexLiveTurn(
-              client,
-              notification.params.threadId,
-              notification.params.turn.id,
-            );
-          }
           return;
         }
         if (
@@ -2202,6 +2267,18 @@ export const makeCodexSessionRuntime = (
             : {}),
           ...(payload !== undefined ? { payload } : {}),
         });
+      });
+
+    const handleRawNotification = (notification: CodexServerNotification) =>
+      Effect.gen(function* () {
+        const sourceThreadIdAtReceipt = currentProviderThreadId(yield* Ref.get(sessionRef));
+        const handle = handleRawNotificationWithReceiptSource(
+          notification,
+          sourceThreadIdAtReceipt,
+        );
+        return yield* notification.method === "thread/started"
+          ? collabChildLiveTurns.withSettlementPermit(handle)
+          : handle;
       });
 
     const currentSessionProviderThreadId = Effect.map(Ref.get(sessionRef), currentProviderThreadId);
