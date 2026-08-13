@@ -1,7 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 
-import { renderMermaidDiagram } from "../../lib/mermaidRenderer";
+import { getCachedMermaidRender, renderMermaidDiagram } from "../../lib/mermaidRenderer";
 import {
+  hasMermaidDiagramToggle,
   mermaidFailureMessage,
   resolveMermaidView,
   type MermaidRenderState,
@@ -21,6 +22,14 @@ import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
  * something to attempt to render as a diagram. The render effect is gated on
  * `fenceClosed` so it never fires on partial source, and fires exactly once
  * when the fence closes (assuming `source`/`theme` are otherwise stable).
+ *
+ * That "otherwise stable" caveat matters more than it looks: the caller's
+ * `pre` override is rebuilt on every streamed token (its memo depends on the
+ * full message `text`), so once the fence has closed, React remounts this
+ * component fresh on every subsequent token instead of just re-rendering it.
+ * `renderState`'s initial value is seeded from `getCachedMermaidRender` so a
+ * remount that already has a known result skips straight to it — no
+ * pending flash, no repeat mermaid.render() call. See `mermaidRenderer.ts`.
  */
 export function MermaidBlock({
   source,
@@ -36,10 +45,24 @@ export function MermaidBlock({
   fenceClosed: boolean;
 }) {
   const [prefersSource, setPrefersSource] = useState(false);
-  const [renderState, setRenderState] = useState<MermaidRenderState>({ status: "pending" });
+  const [renderState, setRenderState] = useState<MermaidRenderState>(
+    () =>
+      (fenceClosed ? getCachedMermaidRender(source, theme) : undefined) ?? { status: "pending" },
+  );
 
   useEffect(() => {
     if (!fenceClosed) {
+      return;
+    }
+    // A remount (see the class comment above) re-runs this effect for a
+    // source/theme pair that may already be cached. Reusing the cached
+    // result here — instead of unconditionally resetting to pending first —
+    // is what actually prevents the flash: `setRenderState` with the exact
+    // object `getCachedMermaidRender` already seeded as the initial state is
+    // a no-op render (React bails via Object.is on the unchanged reference).
+    const cached = getCachedMermaidRender(source, theme);
+    if (cached) {
+      setRenderState(cached);
       return;
     }
     let cancelled = false;
@@ -61,6 +84,17 @@ export function MermaidBlock({
   }, [source, theme, fenceClosed]);
 
   const view = resolveMermaidView({ prefersSource, renderState, fenceClosed });
+  // `exactOptionalPropertyTypes` treats an explicit `mermaidToggle: undefined` as
+  // different from the prop being absent, so the toggle is spread in rather than
+  // passed as `undefined` when there is no diagram yet to toggle to.
+  const mermaidToggleProps = hasMermaidDiagramToggle(renderState)
+    ? {
+        mermaidToggle: {
+          showingSource: prefersSource,
+          onToggle: () => setPrefersSource((v) => !v),
+        },
+      }
+    : {};
 
   return (
     <MarkdownCodeBlock
@@ -68,7 +102,7 @@ export function MermaidBlock({
       language="mermaid"
       fenceTitle={fenceTitle}
       theme={theme}
-      mermaidToggle={{ showingSource: prefersSource, onToggle: () => setPrefersSource((v) => !v) }}
+      {...mermaidToggleProps}
     >
       {view._tag === "Diagram" ? (
         <div

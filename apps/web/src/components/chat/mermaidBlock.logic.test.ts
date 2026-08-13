@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  hasMermaidDiagramToggle,
   isFenceClosed,
   isMermaidFence,
   mermaidFailureMessage,
@@ -189,6 +190,25 @@ describe("isFenceClosed", () => {
     const text = "```mermaid\ngraph TD\nA-->B";
     expect(isFenceClosed(text, undefined, true)).toBe(false);
     expect(isFenceClosed(text, undefined, false)).toBe(true);
+  });
+});
+
+describe("hasMermaidDiagramToggle", () => {
+  it("hides the toggle while there is no diagram yet (pending)", () => {
+    expect(hasMermaidDiagramToggle({ status: "pending" })).toBe(false);
+  });
+
+  it("hides the toggle when the render failed — the source is already on screen", () => {
+    expect(hasMermaidDiagramToggle({ status: "failed", message: "boom" })).toBe(false);
+  });
+
+  it("shows the toggle once a diagram has rendered, so the user can switch to source", () => {
+    // hasMermaidDiagramToggle only looks at renderState — prefersSource is a
+    // separate axis the caller combines it with. A user who has already
+    // switched to source still needs this same control to switch back to
+    // the diagram that is known to exist, which is why the check is on
+    // renderState rather than "not currently showing source".
+    expect(hasMermaidDiagramToggle({ status: "rendered", svg: "<svg></svg>" })).toBe(true);
   });
 });
 

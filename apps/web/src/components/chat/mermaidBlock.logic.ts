@@ -117,6 +117,24 @@ export function resolveMermaidView(input: {
   }
 }
 
+/**
+ * Whether the header's source/diagram toggle should render at all.
+ *
+ * The toggle is only honest once a diagram actually exists to switch
+ * to — `renderState.status === "rendered"` covers both directions: while
+ * `prefersSource` is false it offers the way to source, and once the user
+ * has switched to source (`prefersSource` true) it still offers the way
+ * back, because `renderState` does not change when the user's preference
+ * does. Before a diagram exists — fence still open, still pending, or the
+ * render failed — there is nothing to toggle to, so the control does not
+ * appear; an open fence, a pending render, and a failed render all already
+ * fall through to the code block (or the code block plus an error message)
+ * on their own.
+ */
+export function hasMermaidDiagramToggle(renderState: MermaidRenderState): boolean {
+  return renderState.status === "rendered";
+}
+
 /** Pulls a human-readable message out of whatever a render rejected with.
  * `Error` values read as their `.message`; anything else (a thrown string,
  * a rejected non-Error) is coerced so a failure never surfaces as
