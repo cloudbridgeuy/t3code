@@ -44,6 +44,14 @@ export function MermaidBlock({
   sourceView: ReactNode;
   fenceClosed: boolean;
 }) {
+  // Known limitation: this resets to `false` on every remount (see the class
+  // comment above), so a "Show source" click while trailing tokens are still
+  // streaming gets reverted by the next token. Narrow in practice — once
+  // streaming ends, `text` stops changing, the remounts stop, and the toggle
+  // holds. Not fixed here: a real fix needs the toggle state to survive a
+  // remount (a ref, lifted state, or persistence), which is V4's persisted
+  // mermaid mode to own. Adding a temporary mechanism here only to delete it
+  // in V4 is not worth the churn.
   const [prefersSource, setPrefersSource] = useState(false);
   const [renderState, setRenderState] = useState<MermaidRenderState>(
     () =>
