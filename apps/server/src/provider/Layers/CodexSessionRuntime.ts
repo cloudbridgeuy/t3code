@@ -62,7 +62,6 @@ const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
 ];
 const CODEX_CHILD_INTERRUPT_TIMEOUT = "3 seconds" as const;
 const CODEX_CHILD_INTERRUPT_BATCH_TIMEOUT = "10 seconds" as const;
-const CODEX_REWIND_SETTLEMENT_TIMEOUT = "30 seconds" as const;
 
 export function hasConfiguredMcpServer(appServerArgs: ReadonlyArray<string> | undefined): boolean {
   return appServerArgs?.some((argument) => argument.includes("mcp_servers.")) === true;
@@ -143,7 +142,7 @@ export interface CodexSessionRuntimeShape {
   ) => Effect.Effect<ProviderTurnStartResult, CodexSessionRuntimeError>;
   readonly interruptTurn: (turnId?: TurnId) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly readThread: Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
-  readonly rewindThread: (
+  readonly createRewindTarget: (
     lastTurnId?: TurnId,
   ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
   readonly rollbackThread: (
@@ -167,8 +166,6 @@ export type CodexSessionRuntimeError =
   | CodexSessionRuntimePendingUserInputNotFoundError
   | CodexSessionRuntimeInvalidUserInputAnswersError
   | CodexSessionRuntimeInvalidRetainedTurnError
-  | CodexSessionRuntimeActiveTurnMissingError
-  | CodexSessionRuntimeRewindSettlementTimeoutError
   | CodexSessionRuntimeThreadIdMissingError;
 
 export class CodexSessionRuntimePendingApprovalNotFoundError extends Schema.TaggedErrorClass<CodexSessionRuntimePendingApprovalNotFoundError>()(
@@ -226,28 +223,6 @@ export class CodexSessionRuntimeInvalidRetainedTurnError extends Schema.TaggedEr
     return this.reason === "not-found"
       ? `Codex thread does not contain retained turn '${this.turnId}'`
       : `Codex retained turn '${this.turnId}' is not completed`;
-  }
-}
-
-export class CodexSessionRuntimeActiveTurnMissingError extends Schema.TaggedErrorClass<CodexSessionRuntimeActiveTurnMissingError>()(
-  "CodexSessionRuntimeActiveTurnMissingError",
-  {
-    threadId: Schema.String,
-  },
-) {
-  override get message(): string {
-    return `Codex thread '${this.threadId}' is active but has no active root turn`;
-  }
-}
-
-export class CodexSessionRuntimeRewindSettlementTimeoutError extends Schema.TaggedErrorClass<CodexSessionRuntimeRewindSettlementTimeoutError>()(
-  "CodexSessionRuntimeRewindSettlementTimeoutError",
-  {
-    threadId: Schema.String,
-  },
-) {
-  override get message(): string {
-    return `Codex thread '${this.threadId}' did not settle before rewind timed out`;
   }
 }
 
@@ -723,20 +698,6 @@ export function resolveCodexRewindPlan(
   return { _tag: "fork", lastTurnId };
 }
 
-export function resolveActiveCodexTurnId(
-  turns: ReadonlyArray<{ readonly id: string; readonly status: string }>,
-  sessionActiveTurnId: TurnId | undefined,
-): string | undefined {
-  const inProgressTurns = turns.filter((turn) => turn.status === "inProgress");
-  if (
-    sessionActiveTurnId !== undefined &&
-    inProgressTurns.some((turn) => turn.id === sessionActiveTurnId)
-  ) {
-    return sessionActiveTurnId;
-  }
-  return inProgressTurns.length === 1 ? inProgressTurns[0]?.id : undefined;
-}
-
 export function isCodexTurnNoLongerActiveError(error: CodexErrors.CodexAppServerError): boolean {
   if (error._tag !== "CodexAppServerRequestError") {
     return false;
@@ -769,43 +730,6 @@ export function resolveCodexTurnCompletionSessionUpdate(input: {
   };
 }
 
-export interface CodexRewindWaitPlan {
-  readonly _tag: "ready" | "invalid";
-  readonly rootTurnId: string | undefined;
-  readonly waitForRootCompletion: boolean;
-  readonly waitForSourceIdle: boolean;
-}
-
-export function resolveCodexRewindWaitPlan(input: {
-  readonly turns: ReadonlyArray<{ readonly id: string; readonly status: string }>;
-  readonly sourceStatus: string;
-  readonly sessionActiveTurnId: TurnId | undefined;
-}): CodexRewindWaitPlan {
-  if (input.sourceStatus !== "active") {
-    return {
-      _tag: "ready",
-      rootTurnId: undefined,
-      waitForRootCompletion: false,
-      waitForSourceIdle: false,
-    };
-  }
-  const rootTurnId = resolveActiveCodexTurnId(input.turns, input.sessionActiveTurnId);
-  if (rootTurnId === undefined) {
-    return {
-      _tag: "invalid",
-      rootTurnId: undefined,
-      waitForRootCompletion: false,
-      waitForSourceIdle: false,
-    };
-  }
-  return {
-    _tag: "ready",
-    rootTurnId,
-    waitForRootCompletion: true,
-    waitForSourceIdle: true,
-  };
-}
-
 type CodexThreadRewindMethod = "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start";
 
 interface CodexThreadRewindClient {
@@ -813,60 +737,6 @@ interface CodexThreadRewindClient {
     method: M,
     payload: CodexRpc.ClientRequestParamsByMethod[M],
   ) => Effect.Effect<CodexRpc.ClientRequestResponsesByMethod[M], CodexErrors.CodexAppServerError>;
-}
-
-interface CodexThreadRewindState {
-  readonly getSession: Effect.Effect<ProviderSession>;
-  readonly drainLiveChildTurnsForRewind: Effect.Effect<ReadonlyMap<string, string>>;
-  readonly finishLiveChildTurnSettlement: Effect.Effect<void>;
-  readonly settlePendingRequests: Effect.Effect<void, CodexErrors.CodexAppServerError>;
-  readonly finishPendingRequestSettlement: Effect.Effect<void>;
-  readonly threadMutationSemaphore: Semaphore.Semaphore;
-  readonly rebindProviderThread: (input: {
-    readonly threadId: string;
-    readonly cwd: string;
-    readonly model: string;
-  }) => Effect.Effect<void>;
-}
-
-interface CodexRewindSettlement {
-  readonly sourceThreadId: string;
-  rootTurnId: string | undefined;
-  readonly changes: Queue.Queue<void>;
-  readonly sourceTerminal: Ref.Ref<boolean>;
-}
-
-function makeCodexRewindSettlement(
-  sourceThreadId: string,
-  waitPlan: CodexRewindWaitPlan,
-): Effect.Effect<CodexRewindSettlement> {
-  return Effect.gen(function* () {
-    return {
-      sourceThreadId,
-      rootTurnId: waitPlan.rootTurnId,
-      changes: yield* Queue.unbounded<void>(),
-      sourceTerminal: yield* Ref.make(false),
-    } satisfies CodexRewindSettlement;
-  });
-}
-
-export function isCodexTerminalThreadStatus(status: string): boolean {
-  return status === "idle" || status === "systemError" || status === "notLoaded";
-}
-
-function reconcileCodexRewindSettlement(
-  settlement: CodexRewindSettlement,
-  thread: CodexRpc.ClientRequestResponsesByMethod["thread/read"]["thread"],
-  sessionActiveTurnId: TurnId | undefined,
-): Effect.Effect<string | undefined> {
-  const terminal = isCodexTerminalThreadStatus(thread.status.type);
-  const activeRootTurnId = terminal
-    ? undefined
-    : resolveActiveCodexTurnId(thread.turns, sessionActiveTurnId);
-  settlement.rootTurnId = activeRootTurnId;
-  return terminal
-    ? Ref.set(settlement.sourceTerminal, true).pipe(Effect.as(undefined))
-    : Effect.succeed(activeRootTurnId);
 }
 
 function interruptCodexLiveTurns(
@@ -928,121 +798,29 @@ export function registerCodexLiveChildTurn(input: {
   );
 }
 
-function startCodexReplacementThread(input: {
-  readonly client: CodexThreadRewindClient;
-  readonly sourceThreadId: string;
-  readonly plan: Exclude<CodexRewindPlan, { readonly _tag: "invalid" }>;
-  readonly cwd: string;
-  readonly runtimeMode: RuntimeMode;
-  readonly model: string | undefined;
-  readonly serviceTier: CodexServiceTier | undefined;
-}): Effect.Effect<
-  | CodexRpc.ClientRequestResponsesByMethod["thread/fork"]
-  | CodexRpc.ClientRequestResponsesByMethod["thread/start"],
-  CodexErrors.CodexAppServerError
-> {
-  if (input.plan._tag === "fork") {
-    return input.client.request("thread/fork", {
-      threadId: input.sourceThreadId,
-      lastTurnId: input.plan.lastTurnId,
-    });
-  }
-
-  return input.client.request(
-    "thread/start",
-    buildThreadStartParams({
-      cwd: input.cwd,
-      runtimeMode: input.runtimeMode,
-      model: input.model,
-      serviceTier: input.serviceTier,
-    }),
-  );
-}
-
-export interface CodexThreadRewinder {
-  readonly rewindThread: (
+export const createCodexRewindTarget = Effect.fn("CodexSessionRuntime.createRewindTarget")(
+  function* (
+    input: {
+      readonly client: CodexThreadRewindClient;
+      readonly getSession: Effect.Effect<ProviderSession>;
+      readonly runtimeMode: RuntimeMode;
+      readonly cwd: string;
+      readonly model: string | undefined;
+      readonly serviceTier: CodexServiceTier | undefined;
+    },
     lastTurnId?: TurnId,
-  ) => Effect.Effect<
+  ): Effect.fn.Return<
     CodexThreadSnapshot,
     | CodexErrors.CodexAppServerError
     | CodexSessionRuntimeInvalidRetainedTurnError
-    | CodexSessionRuntimeActiveTurnMissingError
-    | CodexSessionRuntimeRewindSettlementTimeoutError
     | CodexSessionRuntimeThreadIdMissingError
-  >;
-  readonly observeTurnStarted: (input: {
-    readonly threadId: string;
-    readonly turnId: string;
-  }) => Effect.Effect<void>;
-  readonly observeTurnCompleted: (input: {
-    readonly threadId: string;
-    readonly turnId: string;
-  }) => Effect.Effect<void>;
-  readonly observeThreadStatusChanged: (input: {
-    readonly threadId: string;
-    readonly status: { readonly type: string };
-  }) => Effect.Effect<void>;
-}
-
-export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(function* (input: {
-  readonly client: CodexThreadRewindClient;
-  readonly state: CodexThreadRewindState;
-  readonly runtimeMode: RuntimeMode;
-  readonly cwd: string;
-  readonly model: string | undefined;
-  readonly serviceTier: CodexServiceTier | undefined;
-}) {
-  const settlementRef = yield* Ref.make<CodexRewindSettlement | undefined>(undefined);
-
-  const observeTurnStarted: CodexThreadRewinder["observeTurnStarted"] = (notification) =>
-    Ref.get(settlementRef).pipe(
-      Effect.flatMap((settlement) => {
-        if (settlement === undefined || settlement.sourceThreadId !== notification.threadId) {
-          return Effect.void;
-        }
-        settlement.rootTurnId = notification.turnId;
-        return Queue.offer(settlement.changes, undefined).pipe(Effect.asVoid);
-      }),
-    );
-
-  const observeTurnCompleted: CodexThreadRewinder["observeTurnCompleted"] = (notification) =>
-    Ref.get(settlementRef).pipe(
-      Effect.flatMap((settlement) =>
-        settlement !== undefined &&
-        settlement.sourceThreadId === notification.threadId &&
-        settlement.rootTurnId === notification.turnId
-          ? Queue.offer(settlement.changes, undefined).pipe(Effect.asVoid)
-          : Effect.void,
-      ),
-    );
-
-  const observeThreadStatusChanged: CodexThreadRewinder["observeThreadStatusChanged"] = (
-    notification,
-  ) =>
-    Ref.get(settlementRef).pipe(
-      Effect.flatMap((settlement) =>
-        settlement !== undefined &&
-        settlement.sourceThreadId === notification.threadId &&
-        isCodexTerminalThreadStatus(notification.status.type)
-          ? Effect.all(
-              [
-                Ref.set(settlement.sourceTerminal, true),
-                Queue.offer(settlement.changes, undefined),
-              ],
-              { discard: true },
-            )
-          : Effect.void,
-      ),
-    );
-
-  const rewindThread: CodexThreadRewinder["rewindThread"] = Effect.fn(
-    "CodexSessionRuntime.rewindThread",
-  )(function* (lastTurnId) {
-    const session = yield* input.state.getSession;
+  > {
+    const session = yield* input.getSession;
     const sourceThreadId = currentProviderThreadId(session);
     if (sourceThreadId === undefined) {
       return yield* new CodexSessionRuntimeThreadIdMissingError({ threadId: session.threadId });
     }
+
     const source = yield* input.client.request("thread/read", {
       threadId: sourceThreadId,
       includeTurns: true,
@@ -1055,106 +833,25 @@ export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(func
       });
     }
 
-    const waitPlan = resolveCodexRewindWaitPlan({
-      turns: source.thread.turns,
-      sourceStatus: source.thread.status.type,
-      sessionActiveTurnId: session.activeTurnId,
-    });
-    if (waitPlan._tag === "invalid") {
-      return yield* new CodexSessionRuntimeActiveTurnMissingError({ threadId: sourceThreadId });
-    }
-    const settlement = yield* makeCodexRewindSettlement(sourceThreadId, waitPlan);
-    yield* Ref.set(settlementRef, settlement);
+    const replacement =
+      plan._tag === "fork"
+        ? yield* input.client.request("thread/fork", {
+            threadId: sourceThreadId,
+            lastTurnId: plan.lastTurnId,
+          })
+        : yield* input.client.request(
+            "thread/start",
+            buildThreadStartParams({
+              cwd: input.cwd,
+              runtimeMode: input.runtimeMode,
+              model: input.model,
+              serviceTier: input.serviceTier,
+            }),
+          );
 
-    return yield* Effect.gen(function* () {
-      yield* input.state.settlePendingRequests;
-      yield* input.state.drainLiveChildTurnsForRewind.pipe(
-        Effect.flatMap((liveChildTurns) => interruptCodexLiveTurns(input.client, liveChildTurns)),
-      );
-
-      if (waitPlan.waitForRootCompletion || waitPlan.waitForSourceIdle) {
-        yield* Effect.gen(function* () {
-          while (!(yield* Ref.get(settlement.sourceTerminal))) {
-            const reconciled = yield* input.client.request("thread/read", {
-              threadId: sourceThreadId,
-              includeTurns: true,
-            });
-            const currentSession = yield* input.state.getSession;
-            const rootTurnIdToInterrupt = yield* reconcileCodexRewindSettlement(
-              settlement,
-              reconciled.thread,
-              currentSession.activeTurnId,
-            );
-            if (yield* Ref.get(settlement.sourceTerminal)) {
-              break;
-            }
-            if (rootTurnIdToInterrupt === undefined) {
-              yield* Queue.take(settlement.changes);
-              continue;
-            }
-            const interrupted = yield* input.client
-              .request("turn/interrupt", {
-                threadId: sourceThreadId,
-                turnId: rootTurnIdToInterrupt,
-              })
-              .pipe(
-                Effect.as(true),
-                Effect.catchIf(isCodexTurnNoLongerActiveError, () => Effect.succeed(false)),
-              );
-            if (interrupted) {
-              yield* Queue.take(settlement.changes);
-            }
-          }
-        }).pipe(
-          Effect.timeoutOrElse({
-            duration: CODEX_REWIND_SETTLEMENT_TIMEOUT,
-            orElse: () =>
-              Effect.fail(
-                new CodexSessionRuntimeRewindSettlementTimeoutError({
-                  threadId: sourceThreadId,
-                }),
-              ),
-          }),
-        );
-      }
-
-      const replacement = yield* startCodexReplacementThread({
-        client: input.client,
-        sourceThreadId,
-        plan,
-        cwd: input.cwd,
-        runtimeMode: input.runtimeMode,
-        model: input.model,
-        serviceTier: input.serviceTier,
-      });
-
-      yield* input.state.rebindProviderThread({
-        threadId: replacement.thread.id,
-        cwd: replacement.cwd,
-        model: replacement.model,
-      });
-      return parseThreadSnapshot(replacement);
-    }).pipe(
-      Effect.ensuring(
-        Effect.all(
-          [
-            Ref.set(settlementRef, undefined),
-            input.state.finishPendingRequestSettlement,
-            input.state.finishLiveChildTurnSettlement,
-          ],
-          { discard: true },
-        ),
-      ),
-    );
-  }, input.state.threadMutationSemaphore.withPermit);
-
-  return {
-    rewindThread,
-    observeTurnStarted,
-    observeTurnCompleted,
-    observeThreadStatusChanged,
-  } satisfies CodexThreadRewinder;
-});
+    return parseThreadSnapshot(replacement);
+  },
+);
 
 function readNotificationThreadId(notification: CodexServerNotification): string | undefined {
   switch (notification.method) {
@@ -1640,12 +1337,6 @@ export const makeCodexSessionRuntime = (
       Effect.provide(clientContext),
     );
     const serverNotifications = yield* Queue.unbounded<CodexServerNotification>();
-    const drainServerNotifications = (): Effect.Effect<void> =>
-      Queue.poll(serverNotifications).pipe(
-        Effect.flatMap((notification) =>
-          notification._tag === "Some" ? drainServerNotifications() : Effect.void,
-        ),
-      );
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = (purpose: CodexErrors.CodexAppServerIdentifierPurpose) =>
       crypto.randomUUIDv4.pipe(
@@ -1740,78 +1431,18 @@ export const makeCodexSessionRuntime = (
         );
       });
 
-    const settlePendingRequestsForRewind = Effect.all(
-      [
-        pendingApprovals.drainForRewind.pipe(
-          Effect.flatMap((requests) =>
-            Effect.forEach(requests, (request) => resolvePendingApproval(request, "cancel"), {
-              discard: true,
-            }),
-          ),
-        ),
-        pendingUserInputs.drainForRewind.pipe(
-          Effect.flatMap((requests) =>
-            Effect.forEach(requests, (request) => resolvePendingUserInput(request, {}, {}), {
-              discard: true,
-            }),
-          ),
-        ),
-      ],
-      { discard: true },
-    ).pipe(pendingRequestSemaphore.withPermit);
-
-    const threadRewinder = yield* makeCodexThreadRewinder({
-      client,
-      runtimeMode: options.runtimeMode,
-      cwd: options.cwd,
-      model: options.model,
-      serviceTier: options.serviceTier,
-      state: {
-        getSession: Ref.get(sessionRef),
-        drainLiveChildTurnsForRewind: collabChildLiveTurns.drainForRewind,
-        finishLiveChildTurnSettlement: collabChildLiveTurns.settleBeforeRebind(Effect.void),
-        settlePendingRequests: settlePendingRequestsForRewind,
-        finishPendingRequestSettlement: Effect.all(
-          [pendingApprovals.finishRewind, pendingUserInputs.finishRewind],
-          { discard: true },
-        ),
-        threadMutationSemaphore,
-        rebindProviderThread: (replacement) =>
-          collabChildLiveTurns.settleBeforeRebind(
-            Effect.gen(function* () {
-              const currentSession = yield* Ref.get(sessionRef);
-              const retiredThreadIds = new Set(yield* Ref.get(retiredProviderThreadIdsRef));
-              const sourceThreadId = currentProviderThreadId(currentSession);
-              if (sourceThreadId !== undefined) {
-                retiredThreadIds.add(sourceThreadId);
-              }
-              for (const childThreadId of yield* Ref.get(currentProviderChildThreadIdsRef)) {
-                retiredThreadIds.add(childThreadId);
-              }
-              for (const childThreadId of (yield* Ref.get(collabChildAgentsRef)).keys()) {
-                retiredThreadIds.add(childThreadId);
-              }
-              for (const childThreadId of (yield* Ref.get(collabReceiverTurnsRef)).keys()) {
-                retiredThreadIds.add(childThreadId);
-              }
-              retiredThreadIds.delete(replacement.threadId);
-              yield* Ref.set(retiredProviderThreadIdsRef, retiredThreadIds);
-              yield* Ref.set(currentProviderChildThreadIdsRef, new Set());
-              yield* Ref.set(approvalCorrelationsRef, new Map());
-              yield* Ref.set(collabReceiverTurnsRef, new Map());
-              yield* Ref.set(collabChildAgentsRef, new Map());
-              yield* drainServerNotifications();
-              yield* updateSession(sessionRef, {
-                status: "ready",
-                activeTurnId: undefined,
-                cwd: replacement.cwd,
-                model: replacement.model,
-                resumeCursor: { threadId: replacement.threadId },
-              });
-            }),
-          ),
-      },
-    });
+    const createRewindTargetForSession = (lastTurnId?: TurnId) =>
+      createCodexRewindTarget(
+        {
+          client,
+          getSession: Ref.get(sessionRef),
+          runtimeMode: options.runtimeMode,
+          cwd: options.cwd,
+          model: options.model,
+          serviceTier: options.serviceTier,
+        },
+        lastTurnId,
+      );
 
     /**
      * Registers v2 collab children and re-emits their notifications as
@@ -2303,14 +1934,7 @@ export const makeCodexSessionRuntime = (
           return updateSession(sessionRef, {
             status: "running",
             activeTurnId: TurnId.make(payload.turn.id),
-          }).pipe(
-            Effect.andThen(
-              threadRewinder.observeTurnStarted({
-                threadId: payload.threadId,
-                turnId: payload.turn.id,
-              }),
-            ),
-          );
+          });
         }),
       ),
     );
@@ -2332,20 +1956,9 @@ export const makeCodexSessionRuntime = (
               failed: payload.turn.status === "failed",
               lastError,
             }),
-          ).pipe(
-            Effect.andThen(
-              threadRewinder.observeTurnCompleted({
-                threadId: payload.threadId,
-                turnId: payload.turn.id,
-              }),
-            ),
           );
         }),
       ),
-    );
-
-    yield* client.handleServerNotification("thread/status/changed", (payload) =>
-      threadRewinder.observeThreadStatusChanged(payload),
     );
 
     yield* client.handleServerNotification("error", (payload) =>
@@ -2751,7 +2364,7 @@ export const makeCodexSessionRuntime = (
         });
         return parseThreadSnapshot(response);
       }),
-      rewindThread: threadRewinder.rewindThread,
+      createRewindTarget: createRewindTargetForSession,
       rollbackThread: (numTurns) =>
         threadMutationSemaphore.withPermit(
           Effect.gen(function* () {
