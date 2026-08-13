@@ -43,6 +43,7 @@ import {
   resolveActiveCodexTurnId,
   resolveCodexRewindPlan,
   resolveCodexRewindWaitPlan,
+  resolveRetiredCodexChildThreadId,
   resolveCodexTurnCompletionSessionUpdate,
   registerCodexLiveChildTurn,
   toCodexUserInputAnswers,
@@ -570,6 +571,58 @@ describe("resolveCodexTurnCompletionSessionUpdate", () => {
         lastError: undefined,
       }),
       { status: "ready", activeTurnId: undefined },
+    );
+  });
+});
+
+describe("resolveRetiredCodexChildThreadId", () => {
+  const retiredThreadIds = new Set(["retired-source"]);
+
+  it("keeps an already retired child retired", () => {
+    NodeAssert.equal(
+      resolveRetiredCodexChildThreadId({
+        childThreadId: "retired-source",
+        parentThreadId: undefined,
+        spawnParentThreadId: undefined,
+        retiredThreadIds,
+      }),
+      "retired-source",
+    );
+  });
+
+  it("retires a child whose direct parent is retired", () => {
+    NodeAssert.equal(
+      resolveRetiredCodexChildThreadId({
+        childThreadId: "late-child",
+        parentThreadId: "retired-source",
+        spawnParentThreadId: undefined,
+        retiredThreadIds,
+      }),
+      "late-child",
+    );
+  });
+
+  it("retires a child whose spawn parent is retired", () => {
+    NodeAssert.equal(
+      resolveRetiredCodexChildThreadId({
+        childThreadId: "late-child",
+        parentThreadId: undefined,
+        spawnParentThreadId: "retired-source",
+        retiredThreadIds,
+      }),
+      "late-child",
+    );
+  });
+
+  it("preserves a child from the current lineage", () => {
+    NodeAssert.equal(
+      resolveRetiredCodexChildThreadId({
+        childThreadId: "current-child",
+        parentThreadId: "current-source",
+        spawnParentThreadId: "current-source",
+        retiredThreadIds,
+      }),
+      undefined,
     );
   });
 });

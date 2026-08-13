@@ -153,11 +153,6 @@ describe("CodexSessionRuntime collab integration", () => {
       const sourceTurnId = "019fe3f0-0000-7000-8000-000000000001";
       const replacementTurnId = "019fe3f0-0000-7000-8000-000000000002";
       const replacementThreadId = "019fe3f0-0000-7000-8000-000000000003";
-      const registrationA = wireFixture.notifications.find(
-        (entry) =>
-          entry.method === "item/completed" &&
-          (entry.params as { item?: { agentThreadId?: string } }).item?.agentThreadId === CHILD_A,
-      );
       const registrationB = wireFixture.notifications.find(
         (entry) =>
           entry.method === "item/completed" &&
@@ -166,15 +161,14 @@ describe("CodexSessionRuntime collab integration", () => {
       const rootThreadStarted = wireFixture.notifications.find(
         (entry) => entry.method === "thread/started",
       );
-      const childBTurnStarted = wireFixture.notifications.find(
+      const childATurnStarted = wireFixture.notifications.find(
         (entry) =>
           entry.method === "turn/started" &&
-          (entry.params as { threadId?: string }).threadId === CHILD_B,
+          (entry.params as { threadId?: string }).threadId === CHILD_A,
       );
-      assert.isDefined(registrationA);
       assert.isDefined(registrationB);
       assert.isDefined(rootThreadStarted);
-      assert.isDefined(childBTurnStarted);
+      assert.isDefined(childATurnStarted);
 
       const lateChildThreadStarted = {
         ...rootThreadStarted,
@@ -189,6 +183,7 @@ describe("CodexSessionRuntime collab integration", () => {
                 thread_spawn: {
                   agent_nickname: "alpha",
                   agent_path: "/root/alpha",
+                  depth: 1,
                   parent_thread_id: ROOT,
                 },
               },
@@ -197,11 +192,11 @@ describe("CodexSessionRuntime collab integration", () => {
         },
       };
       const lateChildTurnStarted = {
-        ...childBTurnStarted,
+        ...childATurnStarted,
         params: {
-          ...childBTurnStarted.params,
+          ...childATurnStarted.params,
           turn: {
-            ...childBTurnStarted.params.turn,
+            ...childATurnStarted.params.turn,
             id: "019fe3f0-0000-7000-8000-000000000004",
           },
         },
@@ -211,10 +206,7 @@ describe("CodexSessionRuntime collab integration", () => {
         replacementThreadId,
         turnIds: [sourceTurnId, replacementTurnId],
         notifications: [],
-        notificationsByTurnStart: [
-          [registrationA, registrationB],
-          [lateChildThreadStarted, lateChildTurnStarted],
-        ],
+        notificationsByTurnStart: [[registrationB], [lateChildThreadStarted, lateChildTurnStarted]],
       };
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
@@ -264,7 +256,7 @@ describe("CodexSessionRuntime collab integration", () => {
           ?.agentThreadId;
         return (
           (event.method === "collabAgent/started" && agentThreadId === CHILD_A) ||
-          (event.method === "collabAgent/turnStarted" && agentThreadId === CHILD_B)
+          (event.method === "collabAgent/turnStarted" && agentThreadId === CHILD_A)
         );
       });
       assert.deepEqual(staleSyntheticEvents, []);
@@ -274,7 +266,7 @@ describe("CodexSessionRuntime collab integration", () => {
         .filter((line) => line.length > 0)
         .map((line) => JSON.parse(line) as { threadId?: string; turnId?: string });
       assert.includeDeepMembers(interrupts, [
-        { threadId: CHILD_B, turnId: lateChildTurnStarted.params.turn.id },
+        { threadId: CHILD_A, turnId: lateChildTurnStarted.params.turn.id },
       ]);
 
       yield* Fiber.interrupt(eventsFiber);

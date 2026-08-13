@@ -1322,6 +1322,20 @@ function readThreadSpawnSource(thread: { readonly source: unknown }):
   };
 }
 
+export function resolveRetiredCodexChildThreadId(input: {
+  readonly childThreadId: string;
+  readonly parentThreadId: string | undefined;
+  readonly spawnParentThreadId: string | undefined;
+  readonly retiredThreadIds: ReadonlySet<string>;
+}): string | undefined {
+  return input.retiredThreadIds.has(input.childThreadId) ||
+    (input.parentThreadId !== undefined && input.retiredThreadIds.has(input.parentThreadId)) ||
+    (input.spawnParentThreadId !== undefined &&
+      input.retiredThreadIds.has(input.spawnParentThreadId))
+    ? input.childThreadId
+    : undefined;
+}
+
 function rememberCollabReceiverTurns(
   collabReceiverTurns: Map<string, TurnId>,
   notification: CodexServerNotification,
@@ -2031,10 +2045,25 @@ export const makeCodexSessionRuntime = (
       Effect.gen(function* () {
         const sourceThreadIdAtReceipt = currentProviderThreadId(yield* Ref.get(sessionRef));
         const providerConversationId = readNotificationThreadId(notification);
-        if (
-          providerConversationId !== undefined &&
-          (yield* Ref.get(retiredProviderThreadIdsRef)).has(providerConversationId)
-        ) {
+        const retiredThreadIds = yield* Ref.get(retiredProviderThreadIdsRef);
+        if (notification.method === "thread/started") {
+          const retiredChildThreadId = resolveRetiredCodexChildThreadId({
+            childThreadId: notification.params.thread.id,
+            parentThreadId: notification.params.thread.parentThreadId ?? undefined,
+            spawnParentThreadId:
+              readThreadSpawnSource(notification.params.thread)?.parentThreadId ?? undefined,
+            retiredThreadIds,
+          });
+          if (retiredChildThreadId !== undefined) {
+            yield* Ref.update(retiredProviderThreadIdsRef, (current) => {
+              const next = new Set(current);
+              next.add(retiredChildThreadId);
+              return next;
+            });
+            return;
+          }
+        }
+        if (providerConversationId !== undefined && retiredThreadIds.has(providerConversationId)) {
           if (notification.method === "turn/started") {
             yield* interruptCodexLiveTurn(
               client,
