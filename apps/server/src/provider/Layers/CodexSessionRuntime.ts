@@ -323,7 +323,8 @@ export interface CodexLiveChildTurnStore {
     threadId: string,
     turnId: string,
     interrupt: Effect.Effect<void>,
-  ) => Effect.Effect<void>;
+    sourceIsCurrent: Effect.Effect<boolean>,
+  ) => Effect.Effect<boolean>;
   readonly settleBeforeRebind: <A, E, R>(rebind: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   readonly remove: (threadId: string) => Effect.Effect<void>;
   readonly drainForRewind: Effect.Effect<ReadonlyMap<string, string>>;
@@ -356,13 +357,18 @@ export const makeCodexLiveChildTurnStore = Effect.fn("makeCodexLiveChildTurnStor
   return {
     snapshot: Ref.get(stateRef).pipe(Effect.map((state) => state.liveTurns)),
     register,
-    registerAndInterrupt: (threadId, turnId, interrupt) =>
+    registerAndInterrupt: (threadId, turnId, interrupt, sourceIsCurrent) =>
       settlementSemaphore.withPermit(
-        register(threadId, turnId).pipe(
-          Effect.flatMap((interruptImmediately) =>
-            interruptImmediately ? interrupt : Effect.void,
-          ),
-        ),
+        Effect.gen(function* () {
+          if (!(yield* sourceIsCurrent)) {
+            yield* interrupt;
+            return false;
+          }
+          if (yield* register(threadId, turnId)) {
+            yield* interrupt;
+          }
+          return true;
+        }),
       ),
     settleBeforeRebind: (rebind) =>
       settlementSemaphore.withPermit(rebind.pipe(Effect.ensuring(finishRewind))),
@@ -783,7 +789,7 @@ interface CodexThreadRewindState {
 
 interface CodexRewindSettlement {
   readonly sourceThreadId: string;
-  readonly rootTurnId: string | undefined;
+  rootTurnId: string | undefined;
   readonly rootCompleted: Deferred.Deferred<void> | undefined;
   readonly sourceIdle: Deferred.Deferred<void> | undefined;
 }
@@ -821,14 +827,15 @@ export function isCodexTerminalThreadStatus(status: string): boolean {
 function reconcileCodexRewindSettlement(
   settlement: CodexRewindSettlement,
   thread: CodexRpc.ClientRequestResponsesByMethod["thread/read"]["thread"],
-): Effect.Effect<boolean> {
+): Effect.Effect<string | undefined> {
   const terminal = isCodexTerminalThreadStatus(thread.status.type);
-  const rootSettled =
-    settlement.rootTurnId === undefined ||
-    thread.turns.find((turn) => turn.id === settlement.rootTurnId)?.status !== "inProgress";
+  const activeRootTurnId = terminal
+    ? undefined
+    : thread.turns.findLast((turn) => turn.status === "inProgress")?.id;
+  settlement.rootTurnId = activeRootTurnId;
   return Effect.all(
     [
-      settlement.rootCompleted !== undefined && (terminal || rootSettled)
+      settlement.rootCompleted !== undefined && activeRootTurnId === undefined
         ? Deferred.succeed(settlement.rootCompleted, undefined)
         : Effect.void,
       settlement.sourceIdle !== undefined && terminal
@@ -836,7 +843,7 @@ function reconcileCodexRewindSettlement(
         : Effect.void,
     ],
     { discard: true },
-  ).pipe(Effect.as(!terminal && !rootSettled && settlement.rootTurnId !== undefined));
+  ).pipe(Effect.as(activeRootTurnId));
 }
 
 function interruptCodexLiveTurns(
@@ -874,11 +881,27 @@ export function registerCodexLiveChildTurn(input: {
   readonly client: CodexThreadRewindClient;
   readonly threadId: string;
   readonly turnId: string;
-}): Effect.Effect<void> {
+  readonly sourceThreadIdAtReceipt?: string | undefined;
+  readonly getCurrentSourceThreadId?: Effect.Effect<string | undefined> | undefined;
+}): Effect.Effect<boolean> {
+  const interrupt = interruptCodexLiveTurn(input.client, input.threadId, input.turnId);
+  if (input.sourceThreadIdAtReceipt === undefined || input.getCurrentSourceThreadId === undefined) {
+    return input.store.registerAndInterrupt(
+      input.threadId,
+      input.turnId,
+      interrupt,
+      Effect.succeed(true),
+    );
+  }
   return input.store.registerAndInterrupt(
     input.threadId,
     input.turnId,
-    interruptCodexLiveTurn(input.client, input.threadId, input.turnId),
+    interrupt,
+    input.getCurrentSourceThreadId.pipe(
+      Effect.map(
+        (currentSourceThreadId) => currentSourceThreadId === input.sourceThreadIdAtReceipt,
+      ),
+    ),
   );
 }
 
@@ -1019,14 +1042,14 @@ export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(func
             threadId: sourceThreadId,
             includeTurns: true,
           });
-          const interruptRoot = yield* reconcileCodexRewindSettlement(
+          const rootTurnIdToInterrupt = yield* reconcileCodexRewindSettlement(
             settlement,
             reconciled.thread,
           );
-          if (interruptRoot && waitPlan.rootTurnId !== undefined) {
+          if (rootTurnIdToInterrupt !== undefined) {
             yield* input.client.request("turn/interrupt", {
               threadId: sourceThreadId,
-              turnId: waitPlan.rootTurnId,
+              turnId: rootTurnIdToInterrupt,
             });
           }
           yield* awaitCodexRewindSettlement(settlement);
@@ -1650,8 +1673,25 @@ export const makeCodexSessionRuntime = (
      * Returns true when the notification was fully handled (must not reach
      * parent-timeline mapping).
      */
-    const interceptCollabChildNotification = (notification: CodexServerNotification) =>
+    const interceptCollabChildNotification = (
+      notification: CodexServerNotification,
+      sourceThreadIdAtReceipt: string | undefined,
+    ) =>
       Effect.gen(function* () {
+        const currentSourceThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+        if (
+          sourceThreadIdAtReceipt !== undefined &&
+          currentSourceThreadId !== sourceThreadIdAtReceipt
+        ) {
+          if (notification.method === "turn/started") {
+            yield* interruptCodexLiveTurn(
+              client,
+              notification.params.threadId,
+              notification.params.turn.id,
+            );
+          }
+          return true;
+        }
         // Registration path 1: child thread announces itself with a
         // subAgent thread_spawn source.
         if (notification.method === "thread/started") {
@@ -1793,12 +1833,19 @@ export const makeCodexSessionRuntime = (
                 ? ((notification.params as { turn: { id: string } }).turn.id as string)
                 : undefined;
             if (childTurnId) {
-              yield* registerCodexLiveChildTurn({
+              const currentSource = yield* registerCodexLiveChildTurn({
                 store: collabChildLiveTurns,
                 client,
                 threadId: child.agentThreadId,
                 turnId: childTurnId,
+                sourceThreadIdAtReceipt,
+                getCurrentSourceThreadId: Ref.get(sessionRef).pipe(
+                  Effect.map(currentProviderThreadId),
+                ),
               });
+              if (!currentSource) {
+                return true;
+              }
             }
             yield* emitEvent({
               kind: "notification",
@@ -1909,6 +1956,7 @@ export const makeCodexSessionRuntime = (
 
     const handleRawNotification = (notification: CodexServerNotification) =>
       Effect.gen(function* () {
+        const sourceThreadIdAtReceipt = currentProviderThreadId(yield* Ref.get(sessionRef));
         const payload = notification.params;
         const route = readRouteFields(notification);
         const collabReceiverTurns = yield* Ref.get(collabReceiverTurnsRef);
@@ -1925,7 +1973,7 @@ export const makeCodexSessionRuntime = (
         // legacy suppressor below would drop its lifecycle before it could
         // become synthetic collabAgent events (review finding). The
         // suppressor still covers UNREGISTERED children.
-        if (yield* interceptCollabChildNotification(notification)) {
+        if (yield* interceptCollabChildNotification(notification, sourceThreadIdAtReceipt)) {
           yield* Ref.set(collabReceiverTurnsRef, collabReceiverTurns);
           return;
         }
@@ -1970,6 +2018,10 @@ export const makeCodexSessionRuntime = (
                   client,
                   threadId: foreignThreadId,
                   turnId: foreignTurnId,
+                  sourceThreadIdAtReceipt,
+                  getCurrentSourceThreadId: Ref.get(sessionRef).pipe(
+                    Effect.map(currentProviderThreadId),
+                  ),
                 });
               }
             } else if (
