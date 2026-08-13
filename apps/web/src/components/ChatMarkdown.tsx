@@ -11,7 +11,6 @@ import {
   Minimize2Icon,
   OctagonAlertIcon,
   TriangleAlertIcon,
-  WrapTextIcon,
 } from "lucide-react";
 import type { ScopedThreadRef, ServerProviderSkill } from "@t3tools/contracts";
 import {
@@ -46,12 +45,17 @@ import remarkGfm from "remark-gfm";
 import { remarkGithubAlerts } from "../markdown-github-alerts";
 import { renderSkillInlineMarkdownChildren } from "./chat/SkillInlineText";
 import { CHAT_FILE_TAG_CHIP_CLASS_NAME, FileTagChipContent } from "./chat/FileTagChip";
-import { PierreEntryIcon } from "./chat/PierreEntryIcon";
 import {
   resolveExternalWebLinkHost,
   showExternalLinkContextMenu,
 } from "./chat/externalLinkContextMenu";
-import { hasSpecificPierreIconForFileName, syntheticFileNameForLanguageId } from "../pierre-icons";
+import {
+  MarkdownCodeBlock,
+  readInitialWordWrapSetting,
+  reportMarkdownActionFailure,
+} from "./chat/MarkdownCodeBlock";
+import { MermaidBlock } from "./chat/MermaidBlock";
+import { isMermaidFence } from "./chat/mermaidBlock.logic";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "./ui/collapsible";
@@ -66,7 +70,6 @@ import { LRUCache } from "../lib/lruCache";
 import { getSyntaxHighlighterPromise } from "../lib/syntaxHighlighting";
 import { RenderErrorBoundary } from "./RenderErrorBoundary";
 import { useTheme } from "../hooks/useTheme";
-import { getClientSettings } from "../hooks/useSettings";
 import {
   chatMarkdownClipboardPayload,
   serializeTableElementToCsv,
@@ -117,19 +120,6 @@ const EMPTY_MARKDOWN_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "d
 const CODE_FENCE_LANGUAGE_REGEX = /(?:^|\s)language-([^\s]+)/;
 const MAX_HIGHLIGHT_CACHE_ENTRIES = 500;
 const MAX_HIGHLIGHT_CACHE_MEMORY_BYTES = 50 * 1024 * 1024;
-
-interface MarkdownActionFailureContext {
-  readonly operation: string;
-  readonly target?: string;
-  readonly format?: "markdown" | "csv";
-  readonly language?: string;
-  readonly fenceTitle?: string;
-  readonly copyTarget?: string;
-}
-
-function reportMarkdownActionFailure(context: MarkdownActionFailureContext, cause: unknown): void {
-  console.error("[chat-markdown] action failed", context, cause);
-}
 
 const highlightedCodeCache = new LRUCache<string>(
   MAX_HIGHLIGHT_CACHE_ENTRIES,
@@ -360,10 +350,6 @@ function estimateHighlightedSize(html: string, code: string): number {
   return Math.max(html.length * 2, code.length * 3);
 }
 
-function readInitialWordWrapSetting(): boolean {
-  return getClientSettings().wordWrap;
-}
-
 function MarkdownTable({ children, ...props }: React.ComponentProps<"table">) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const tableRef = useRef<HTMLTableElement | null>(null);
@@ -539,161 +525,6 @@ function MarkdownDetails({
         </div>
       </CollapsiblePanel>
     </Collapsible>
-  );
-}
-
-/**
- * Filename titles render icon + text; language-only titles render just the
- * icon (redundant next to its own name) and fall back to the language text
- * when no specific icon exists or it fails to load.
- */
-function MarkdownCodeBlockTitleContent({
-  fenceTitle,
-  language,
-  theme,
-}: {
-  fenceTitle: string | null;
-  language: string;
-  theme: "light" | "dark";
-}) {
-  if (fenceTitle) {
-    return (
-      <>
-        <PierreEntryIcon pathValue={fenceTitle} kind="file" theme={theme} className="size-3.5" />
-        <span className="truncate">{fenceTitle}</span>
-      </>
-    );
-  }
-
-  const fileName = syntheticFileNameForLanguageId(language);
-  if (!hasSpecificPierreIconForFileName(fileName)) {
-    return <span className="truncate">{language}</span>;
-  }
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <span className="inline-flex shrink-0 rounded-sm" aria-label={`Language: ${language}`} />
-        }
-      >
-        <PierreEntryIcon pathValue={fileName} kind="file" theme={theme} className="size-3.5" />
-      </TooltipTrigger>
-      <TooltipPopup side="top">{language}</TooltipPopup>
-    </Tooltip>
-  );
-}
-
-function MarkdownCodeBlock({
-  code,
-  language,
-  fenceTitle,
-  theme,
-  children,
-}: {
-  code: string;
-  language: string;
-  fenceTitle: string | null;
-  theme: "light" | "dark";
-  children: ReactNode;
-}) {
-  const [copied, setCopied] = useState(false);
-  const [wrapped, setWrapped] = useState(readInitialWordWrapSetting);
-  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const wrapLabel = wrapped ? "Disable line wrap" : "Wrap lines";
-  const copyLabel = copied ? "Copied" : "Copy code";
-
-  const handleCopy = useCallback(() => {
-    if (typeof navigator === "undefined" || navigator.clipboard == null) {
-      return;
-    }
-    void navigator.clipboard
-      .writeText(code)
-      .then(() => {
-        if (copiedTimerRef.current != null) {
-          clearTimeout(copiedTimerRef.current);
-        }
-        setCopied(true);
-        copiedTimerRef.current = setTimeout(() => {
-          setCopied(false);
-          copiedTimerRef.current = null;
-        }, 1200);
-      })
-      .catch((cause) => {
-        reportMarkdownActionFailure(
-          {
-            operation: "copy-code-block",
-            language,
-            ...(fenceTitle ? { fenceTitle } : {}),
-          },
-          cause,
-        );
-      });
-  }, [code, fenceTitle, language]);
-
-  useEffect(
-    () => () => {
-      if (copiedTimerRef.current != null) {
-        clearTimeout(copiedTimerRef.current);
-        copiedTimerRef.current = null;
-      }
-    },
-    [],
-  );
-
-  return (
-    <div
-      className="chat-markdown-codeblock border border-border/70 bg-secondary leading-snug dark:border-transparent dark:bg-input/32"
-      data-language={language}
-      data-wrap={wrapped ? "true" : "false"}
-    >
-      <div className="chat-markdown-codeblock-header select-none">
-        <span className="chat-markdown-codeblock-title">
-          <MarkdownCodeBlockTitleContent
-            fenceTitle={fenceTitle}
-            language={language}
-            theme={theme}
-          />
-        </span>
-        <span className="flex items-center gap-0.5" role="toolbar" aria-label="Code block actions">
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="chat-markdown-chrome-action"
-                  aria-pressed={wrapped}
-                  onClick={() => setWrapped((value) => !value)}
-                  aria-label={wrapLabel}
-                />
-              }
-            >
-              <WrapTextIcon className="size-3" />
-            </TooltipTrigger>
-            <TooltipPopup side="top">{wrapLabel}</TooltipPopup>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="chat-markdown-chrome-action"
-                  onClick={handleCopy}
-                  aria-label={copyLabel}
-                />
-              }
-            >
-              {copied ? <CheckIcon className="size-3" /> : <CopyIcon className="size-3" />}
-            </TooltipTrigger>
-            <TooltipPopup side="top">{copyLabel}</TooltipPopup>
-          </Tooltip>
-        </span>
-      </div>
-      {children}
-    </div>
   );
 }
 
@@ -1657,6 +1488,32 @@ function ChatMarkdown({
 
         const language = extractFenceLanguage(codeBlock.className);
         const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
+        const shikiElement = (
+          <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
+            <Suspense fallback={<pre {...props}>{children}</pre>}>
+              <SuspenseShikiCodeBlock
+                className={codeBlock.className}
+                code={codeBlock.code}
+                themeName={diffThemeName}
+                isStreaming={isStreaming}
+              />
+            </Suspense>
+          </RenderErrorBoundary>
+        );
+
+        if (isMermaidFence(language) && !isStreaming) {
+          return (
+            <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
+              <MermaidBlock
+                source={codeBlock.code}
+                fenceTitle={fenceTitle}
+                theme={resolvedTheme}
+                sourceView={shikiElement}
+              />
+            </RenderErrorBoundary>
+          );
+        }
+
         return (
           <MarkdownCodeBlock
             code={codeBlock.code}
@@ -1664,16 +1521,7 @@ function ChatMarkdown({
             fenceTitle={fenceTitle}
             theme={resolvedTheme}
           >
-            <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
-              <Suspense fallback={<pre {...props}>{children}</pre>}>
-                <SuspenseShikiCodeBlock
-                  className={codeBlock.className}
-                  code={codeBlock.code}
-                  themeName={diffThemeName}
-                  isStreaming={isStreaming}
-                />
-              </Suspense>
-            </RenderErrorBoundary>
+            {shikiElement}
           </MarkdownCodeBlock>
         );
       },
