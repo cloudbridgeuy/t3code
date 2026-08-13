@@ -721,10 +721,46 @@ export function resolveActiveCodexTurnId(
   turns: ReadonlyArray<{ readonly id: string; readonly status: string }>,
   sessionActiveTurnId: TurnId | undefined,
 ): string | undefined {
-  if (sessionActiveTurnId !== undefined) {
+  const inProgressTurns = turns.filter((turn) => turn.status === "inProgress");
+  if (
+    sessionActiveTurnId !== undefined &&
+    inProgressTurns.some((turn) => turn.id === sessionActiveTurnId)
+  ) {
     return sessionActiveTurnId;
   }
-  return turns.findLast((turn) => turn.status === "inProgress")?.id;
+  return inProgressTurns.length === 1 ? inProgressTurns[0]?.id : undefined;
+}
+
+export function isCodexTurnNoLongerActiveError(error: CodexErrors.CodexAppServerError): boolean {
+  if (error._tag !== "CodexAppServerRequestError") {
+    return false;
+  }
+  const message = error.errorMessage.toLowerCase();
+  return (
+    message.includes("already completed") ||
+    message.includes("already finished") ||
+    message.includes("not active") ||
+    message.includes("not in progress") ||
+    message.includes("no active turn") ||
+    (message.includes("cannot interrupt") &&
+      (message.includes("completed") || message.includes("finished")))
+  );
+}
+
+export function resolveCodexTurnCompletionSessionUpdate(input: {
+  readonly currentActiveTurnId: TurnId | undefined;
+  readonly completedTurnId: string;
+  readonly failed: boolean;
+  readonly lastError: string | undefined;
+}): Partial<ProviderSession> {
+  if (input.currentActiveTurnId !== input.completedTurnId) {
+    return {};
+  }
+  return {
+    status: input.failed ? "error" : "ready",
+    activeTurnId: undefined,
+    ...(input.lastError ? { lastError: input.lastError } : {}),
+  };
 }
 
 export interface CodexRewindWaitPlan {
@@ -790,8 +826,8 @@ interface CodexThreadRewindState {
 interface CodexRewindSettlement {
   readonly sourceThreadId: string;
   rootTurnId: string | undefined;
-  readonly rootCompleted: Deferred.Deferred<void> | undefined;
-  readonly sourceIdle: Deferred.Deferred<void> | undefined;
+  readonly changes: Queue.Queue<void>;
+  readonly sourceTerminal: Ref.Ref<boolean>;
 }
 
 function makeCodexRewindSettlement(
@@ -799,24 +835,12 @@ function makeCodexRewindSettlement(
   waitPlan: CodexRewindWaitPlan,
 ): Effect.Effect<CodexRewindSettlement> {
   return Effect.gen(function* () {
-    const rootCompleted = waitPlan.waitForRootCompletion ? yield* Deferred.make<void>() : undefined;
-    const sourceIdle = waitPlan.waitForSourceIdle ? yield* Deferred.make<void>() : undefined;
     return {
       sourceThreadId,
       rootTurnId: waitPlan.rootTurnId,
-      rootCompleted,
-      sourceIdle,
+      changes: yield* Queue.unbounded<void>(),
+      sourceTerminal: yield* Ref.make(false),
     } satisfies CodexRewindSettlement;
-  });
-}
-
-function awaitCodexRewindSettlement(settlement: CodexRewindSettlement): Effect.Effect<void> {
-  const deferreds = [settlement.rootCompleted, settlement.sourceIdle].filter(
-    (deferred): deferred is Deferred.Deferred<void> => deferred !== undefined,
-  );
-  return Effect.forEach(deferreds, Deferred.await, {
-    concurrency: "unbounded",
-    discard: true,
   });
 }
 
@@ -827,23 +851,16 @@ export function isCodexTerminalThreadStatus(status: string): boolean {
 function reconcileCodexRewindSettlement(
   settlement: CodexRewindSettlement,
   thread: CodexRpc.ClientRequestResponsesByMethod["thread/read"]["thread"],
+  sessionActiveTurnId: TurnId | undefined,
 ): Effect.Effect<string | undefined> {
   const terminal = isCodexTerminalThreadStatus(thread.status.type);
   const activeRootTurnId = terminal
     ? undefined
-    : thread.turns.findLast((turn) => turn.status === "inProgress")?.id;
+    : resolveActiveCodexTurnId(thread.turns, sessionActiveTurnId);
   settlement.rootTurnId = activeRootTurnId;
-  return Effect.all(
-    [
-      settlement.rootCompleted !== undefined && activeRootTurnId === undefined
-        ? Deferred.succeed(settlement.rootCompleted, undefined)
-        : Effect.void,
-      settlement.sourceIdle !== undefined && terminal
-        ? Deferred.succeed(settlement.sourceIdle, undefined)
-        : Effect.void,
-    ],
-    { discard: true },
-  ).pipe(Effect.as(activeRootTurnId));
+  return terminal
+    ? Ref.set(settlement.sourceTerminal, true).pipe(Effect.as(undefined))
+    : Effect.succeed(activeRootTurnId);
 }
 
 function interruptCodexLiveTurns(
@@ -947,6 +964,10 @@ export interface CodexThreadRewinder {
     | CodexSessionRuntimeRewindSettlementTimeoutError
     | CodexSessionRuntimeThreadIdMissingError
   >;
+  readonly observeTurnStarted: (input: {
+    readonly threadId: string;
+    readonly turnId: string;
+  }) => Effect.Effect<void>;
   readonly observeTurnCompleted: (input: {
     readonly threadId: string;
     readonly turnId: string;
@@ -967,13 +988,24 @@ export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(func
 }) {
   const settlementRef = yield* Ref.make<CodexRewindSettlement | undefined>(undefined);
 
+  const observeTurnStarted: CodexThreadRewinder["observeTurnStarted"] = (notification) =>
+    Ref.get(settlementRef).pipe(
+      Effect.flatMap((settlement) => {
+        if (settlement === undefined || settlement.sourceThreadId !== notification.threadId) {
+          return Effect.void;
+        }
+        settlement.rootTurnId = notification.turnId;
+        return Queue.offer(settlement.changes, undefined).pipe(Effect.asVoid);
+      }),
+    );
+
   const observeTurnCompleted: CodexThreadRewinder["observeTurnCompleted"] = (notification) =>
     Ref.get(settlementRef).pipe(
       Effect.flatMap((settlement) =>
-        settlement?.rootCompleted !== undefined &&
+        settlement !== undefined &&
         settlement.sourceThreadId === notification.threadId &&
         settlement.rootTurnId === notification.turnId
-          ? Deferred.succeed(settlement.rootCompleted, undefined).pipe(Effect.asVoid)
+          ? Queue.offer(settlement.changes, undefined).pipe(Effect.asVoid)
           : Effect.void,
       ),
     );
@@ -983,15 +1015,13 @@ export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(func
   ) =>
     Ref.get(settlementRef).pipe(
       Effect.flatMap((settlement) =>
-        settlement?.sourceIdle !== undefined &&
+        settlement !== undefined &&
         settlement.sourceThreadId === notification.threadId &&
         isCodexTerminalThreadStatus(notification.status.type)
           ? Effect.all(
               [
-                Deferred.succeed(settlement.sourceIdle, undefined),
-                settlement.rootCompleted !== undefined
-                  ? Deferred.succeed(settlement.rootCompleted, undefined)
-                  : Effect.void,
+                Ref.set(settlement.sourceTerminal, true),
+                Queue.offer(settlement.changes, undefined),
               ],
               { discard: true },
             )
@@ -1038,21 +1068,37 @@ export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(func
 
       if (waitPlan.waitForRootCompletion || waitPlan.waitForSourceIdle) {
         yield* Effect.gen(function* () {
-          const reconciled = yield* input.client.request("thread/read", {
-            threadId: sourceThreadId,
-            includeTurns: true,
-          });
-          const rootTurnIdToInterrupt = yield* reconcileCodexRewindSettlement(
-            settlement,
-            reconciled.thread,
-          );
-          if (rootTurnIdToInterrupt !== undefined) {
-            yield* input.client.request("turn/interrupt", {
+          while (!(yield* Ref.get(settlement.sourceTerminal))) {
+            const reconciled = yield* input.client.request("thread/read", {
               threadId: sourceThreadId,
-              turnId: rootTurnIdToInterrupt,
+              includeTurns: true,
             });
+            const currentSession = yield* input.state.getSession;
+            const rootTurnIdToInterrupt = yield* reconcileCodexRewindSettlement(
+              settlement,
+              reconciled.thread,
+              currentSession.activeTurnId,
+            );
+            if (yield* Ref.get(settlement.sourceTerminal)) {
+              break;
+            }
+            if (rootTurnIdToInterrupt === undefined) {
+              yield* Queue.take(settlement.changes);
+              continue;
+            }
+            const interrupted = yield* input.client
+              .request("turn/interrupt", {
+                threadId: sourceThreadId,
+                turnId: rootTurnIdToInterrupt,
+              })
+              .pipe(
+                Effect.as(true),
+                Effect.catchIf(isCodexTurnNoLongerActiveError, () => Effect.succeed(false)),
+              );
+            if (interrupted) {
+              yield* Queue.take(settlement.changes);
+            }
           }
-          yield* awaitCodexRewindSettlement(settlement);
         }).pipe(
           Effect.timeoutOrElse({
             duration: CODEX_REWIND_SETTLEMENT_TIMEOUT,
@@ -1098,6 +1144,7 @@ export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(func
 
   return {
     rewindThread,
+    observeTurnStarted,
     observeTurnCompleted,
     observeThreadStatusChanged,
   } satisfies CodexThreadRewinder;
@@ -1469,6 +1516,8 @@ export const makeCodexSessionRuntime = (
     const pendingUserInputs = yield* makeCodexPendingRequestStore<PendingUserInput>();
     const collabReceiverTurnsRef = yield* Ref.make(new Map<string, TurnId>());
     const collabChildAgentsRef = yield* Ref.make(new Map<string, CollabChildAgentState>());
+    const currentProviderChildThreadIdsRef = yield* Ref.make(new Set<string>());
+    const retiredProviderThreadIdsRef = yield* Ref.make(new Set<string>());
     /** Child provider-thread id → its currently running provider turn id. */
     const collabChildLiveTurns = yield* makeCodexLiveChildTurnStore();
     const closedRef = yield* Ref.make(false);
@@ -1518,6 +1567,12 @@ export const makeCodexSessionRuntime = (
       Effect.provide(clientContext),
     );
     const serverNotifications = yield* Queue.unbounded<CodexServerNotification>();
+    const drainServerNotifications = (): Effect.Effect<void> =>
+      Queue.poll(serverNotifications).pipe(
+        Effect.flatMap((notification) =>
+          notification._tag === "Some" ? drainServerNotifications() : Effect.void,
+        ),
+      );
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = (purpose: CodexErrors.CodexAppServerIdentifierPurpose) =>
       crypto.randomUUIDv4.pipe(
@@ -1651,10 +1706,28 @@ export const makeCodexSessionRuntime = (
         rebindProviderThread: (replacement) =>
           collabChildLiveTurns.settleBeforeRebind(
             Effect.gen(function* () {
+              const currentSession = yield* Ref.get(sessionRef);
+              const retiredThreadIds = new Set(yield* Ref.get(retiredProviderThreadIdsRef));
+              const sourceThreadId = currentProviderThreadId(currentSession);
+              if (sourceThreadId !== undefined) {
+                retiredThreadIds.add(sourceThreadId);
+              }
+              for (const childThreadId of yield* Ref.get(currentProviderChildThreadIdsRef)) {
+                retiredThreadIds.add(childThreadId);
+              }
+              for (const childThreadId of (yield* Ref.get(collabChildAgentsRef)).keys()) {
+                retiredThreadIds.add(childThreadId);
+              }
+              for (const childThreadId of (yield* Ref.get(collabReceiverTurnsRef)).keys()) {
+                retiredThreadIds.add(childThreadId);
+              }
+              retiredThreadIds.delete(replacement.threadId);
+              yield* Ref.set(retiredProviderThreadIdsRef, retiredThreadIds);
+              yield* Ref.set(currentProviderChildThreadIdsRef, new Set());
               yield* Ref.set(approvalCorrelationsRef, new Map());
               yield* Ref.set(collabReceiverTurnsRef, new Map());
               yield* Ref.set(collabChildAgentsRef, new Map());
-              yield* Queue.takeAll(serverNotifications);
+              yield* drainServerNotifications();
               yield* updateSession(sessionRef, {
                 status: "ready",
                 activeTurnId: undefined,
@@ -1957,6 +2030,31 @@ export const makeCodexSessionRuntime = (
     const handleRawNotification = (notification: CodexServerNotification) =>
       Effect.gen(function* () {
         const sourceThreadIdAtReceipt = currentProviderThreadId(yield* Ref.get(sessionRef));
+        const providerConversationId = readNotificationThreadId(notification);
+        if (
+          providerConversationId !== undefined &&
+          (yield* Ref.get(retiredProviderThreadIdsRef)).has(providerConversationId)
+        ) {
+          if (notification.method === "turn/started") {
+            yield* interruptCodexLiveTurn(
+              client,
+              notification.params.threadId,
+              notification.params.turn.id,
+            );
+          }
+          return;
+        }
+        if (
+          providerConversationId !== undefined &&
+          sourceThreadIdAtReceipt !== undefined &&
+          providerConversationId !== sourceThreadIdAtReceipt
+        ) {
+          yield* Ref.update(currentProviderChildThreadIdsRef, (current) => {
+            const next = new Set(current);
+            next.add(providerConversationId);
+            return next;
+          });
+        }
         const payload = notification.params;
         const route = readRouteFields(notification);
         const collabReceiverTurns = yield* Ref.get(collabReceiverTurnsRef);
@@ -2101,7 +2199,14 @@ export const makeCodexSessionRuntime = (
           return updateSession(sessionRef, {
             status: "running",
             activeTurnId: TurnId.make(payload.turn.id),
-          });
+          }).pipe(
+            Effect.andThen(
+              threadRewinder.observeTurnStarted({
+                threadId: payload.threadId,
+                turnId: payload.turn.id,
+              }),
+            ),
+          );
         }),
       ),
     );
@@ -2116,20 +2221,21 @@ export const makeCodexSessionRuntime = (
             payload.turn.status === "failed" && "error" in payload.turn && payload.turn.error
               ? payload.turn.error.message
               : undefined;
-          return threadRewinder
-            .observeTurnCompleted({
-              threadId: payload.threadId,
-              turnId: payload.turn.id,
-            })
-            .pipe(
-              Effect.andThen(
-                updateSession(sessionRef, {
-                  status: payload.turn.status === "failed" ? "error" : "ready",
-                  activeTurnId: undefined,
-                  ...(lastError ? { lastError } : {}),
-                }),
-              ),
-            );
+          return updateSession(sessionRef, (session) =>
+            resolveCodexTurnCompletionSessionUpdate({
+              currentActiveTurnId: session.activeTurnId,
+              completedTurnId: payload.turn.id,
+              failed: payload.turn.status === "failed",
+              lastError,
+            }),
+          ).pipe(
+            Effect.andThen(
+              threadRewinder.observeTurnCompleted({
+                threadId: payload.threadId,
+                turnId: payload.turn.id,
+              }),
+            ),
+          );
         }),
       ),
     );

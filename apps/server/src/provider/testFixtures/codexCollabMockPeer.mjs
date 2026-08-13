@@ -17,6 +17,9 @@ const script = JSON.parse(NodeFS.readFileSync(process.env.T3_CODEX_COLLAB_SCRIPT
 
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 let turnStartCount = 0;
+let threadStartCount = 0;
+let currentTurns = [];
+let currentStatus = { type: "idle" };
 
 const rl = NodeReadline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -40,7 +43,34 @@ rl.on("line", (line) => {
     return;
   }
   if (method === "thread/start" || method === "thread/resume") {
-    write({ id, result: fixture.responses.threadStart });
+    const threadId =
+      threadStartCount > 0 && script.replacementThreadId
+        ? script.replacementThreadId
+        : script.rootThreadId;
+    threadStartCount += 1;
+    currentTurns = [];
+    currentStatus = { type: "idle" };
+    write({
+      id,
+      result: {
+        ...fixture.responses.threadStart,
+        thread: { ...fixture.responses.threadStart.thread, id: threadId, turns: [] },
+      },
+    });
+    return;
+  }
+  if (method === "thread/read") {
+    write({
+      id,
+      result: {
+        thread: {
+          ...fixture.responses.threadStart.thread,
+          id: message.params?.threadId,
+          turns: currentTurns,
+          status: currentStatus,
+        },
+      },
+    });
     return;
   }
   if (method === "turn/start") {
@@ -49,8 +79,10 @@ rl.on("line", (line) => {
       ? { ...fixture.responses.turnStart.turn, id: turnId }
       : fixture.responses.turnStart.turn;
     turnStartCount += 1;
+    currentTurns = [...currentTurns, { ...turn, status: "inProgress" }];
+    currentStatus = { type: "active", activeFlags: [] };
     write({ id, result: { ...fixture.responses.turnStart, turn } });
-    const rootThreadId = script.rootThreadId;
+    const rootThreadId = message.params?.threadId ?? script.rootThreadId;
     if (script.onlyFirstTurnStarts !== true || turnStartCount === 1) {
       write({
         jsonrpc: "2.0",
@@ -58,10 +90,16 @@ rl.on("line", (line) => {
         params: { threadId: rootThreadId, turn },
       });
     }
-    for (const notification of script.notifications) {
+    const notifications =
+      script.notificationsByTurnStart?.[turnStartCount - 1] ?? script.notifications;
+    for (const notification of notifications) {
       write({ jsonrpc: "2.0", method: notification.method, params: notification.params });
     }
     if (script.holdTurnOpen !== true) {
+      currentTurns = currentTurns.map((candidate) =>
+        candidate.id === turn.id ? { ...candidate, status: "completed" } : candidate,
+      );
+      currentStatus = { type: "idle" };
       write({
         jsonrpc: "2.0",
         method: "turn/completed",

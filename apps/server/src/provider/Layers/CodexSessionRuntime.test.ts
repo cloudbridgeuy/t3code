@@ -29,8 +29,10 @@ import {
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import {
   buildTurnStartParams,
+  type CodexThreadRewinder,
   hasConfiguredMcpServer,
   isCodexTerminalThreadStatus,
+  isCodexTurnNoLongerActiveError,
   isRecoverableThreadResumeError,
   makeCodexThreadRewinder,
   makeCodexApprovalDecisionEvent,
@@ -41,6 +43,7 @@ import {
   resolveActiveCodexTurnId,
   resolveCodexRewindPlan,
   resolveCodexRewindWaitPlan,
+  resolveCodexTurnCompletionSessionUpdate,
   registerCodexLiveChildTurn,
   toCodexUserInputAnswers,
 } from "./CodexSessionRuntime.ts";
@@ -485,16 +488,89 @@ describe("resolveActiveCodexTurnId", () => {
     { id: "active-turn", status: "inProgress" },
   ] as const;
 
-  it("uses the runtime active turn before the thread snapshot", () => {
+  it("ignores a stale runtime turn that is absent from the active snapshot", () => {
     NodeAssert.equal(
       resolveActiveCodexTurnId(turns, TurnId.make("runtime-active-turn")),
-      "runtime-active-turn",
+      "active-turn",
     );
   });
 
   it("falls back to the last in-progress snapshot turn", () => {
     NodeAssert.equal(resolveActiveCodexTurnId(turns, undefined), "active-turn");
     NodeAssert.equal(resolveActiveCodexTurnId(turns.slice(0, 1), undefined), undefined);
+  });
+
+  it("uses the runtime active turn when several snapshot turns are in progress", () => {
+    NodeAssert.equal(
+      resolveActiveCodexTurnId(
+        [
+          { id: "actual-active-turn", status: "inProgress" },
+          { id: "queued-follow-up", status: "inProgress" },
+        ],
+        TurnId.make("actual-active-turn"),
+      ),
+      "actual-active-turn",
+    );
+  });
+});
+
+describe("isCodexTurnNoLongerActiveError", () => {
+  it("accepts completed and inactive turn request failures", () => {
+    for (const errorMessage of [
+      "turn is not active",
+      "turn already completed",
+      "cannot interrupt completed turn",
+      "no active turn",
+    ]) {
+      NodeAssert.equal(
+        isCodexTurnNoLongerActiveError(
+          new CodexErrors.CodexAppServerRequestError({ code: -32602, errorMessage }),
+        ),
+        true,
+      );
+    }
+  });
+
+  it("rejects unrelated request and transport failures", () => {
+    NodeAssert.equal(
+      isCodexTurnNoLongerActiveError(
+        new CodexErrors.CodexAppServerRequestError({
+          code: -32603,
+          errorMessage: "permission denied",
+        }),
+      ),
+      false,
+    );
+    NodeAssert.equal(
+      isCodexTurnNoLongerActiveError(new CodexErrors.CodexAppServerInputStreamEndedError()),
+      false,
+    );
+  });
+});
+
+describe("resolveCodexTurnCompletionSessionUpdate", () => {
+  it("preserves a newer active turn when an older queued turn completes", () => {
+    NodeAssert.deepStrictEqual(
+      resolveCodexTurnCompletionSessionUpdate({
+        currentActiveTurnId: TurnId.make("root-b"),
+        completedTurnId: "root-a",
+        failed: false,
+        lastError: undefined,
+      }),
+      {},
+    );
+  });
+
+  it("settles the session when the current active turn completes", () => {
+    NodeAssert.deepStrictEqual(
+      resolveCodexTurnCompletionSessionUpdate({
+        currentActiveTurnId: TurnId.make("root-b"),
+        completedTurnId: "root-b",
+        failed: false,
+        lastError: undefined,
+      }),
+      { status: "ready", activeTurnId: undefined },
+    );
   });
 });
 
@@ -504,7 +580,7 @@ describe("resolveCodexRewindWaitPlan", () => {
     { id: "active-turn", status: "inProgress" },
   ] as const;
 
-  it("waits for the runtime active turn and a non-idle source thread", () => {
+  it("waits for the authoritative active turn and a non-idle source thread", () => {
     NodeAssert.deepStrictEqual(
       resolveCodexRewindWaitPlan({
         turns,
@@ -513,7 +589,7 @@ describe("resolveCodexRewindWaitPlan", () => {
       }),
       {
         _tag: "ready",
-        rootTurnId: "runtime-active-turn",
+        rootTurnId: "active-turn",
         waitForRootCompletion: true,
         waitForSourceIdle: true,
       },
@@ -1028,6 +1104,125 @@ describe("makeCodexThreadRewinder", () => {
       });
       const snapshot = yield* Fiber.join(fiber);
       NodeAssert.equal(reads, 2);
+      NodeAssert.equal(snapshot.threadId, "replacement-thread");
+    }),
+  );
+
+  it.effect("reconciles again when the selected root completes before interruption", () =>
+    Effect.gen(function* () {
+      let reads = 0;
+      let sourceSettled = false;
+      const interruptedTurns: Array<string> = [];
+      const initial = makeThreadReadResponse({
+        status: "active",
+        turns: [{ id: "root-a", status: "inProgress" }],
+      });
+      const rootBActive = makeThreadReadResponse({
+        status: "active",
+        turns: [
+          { id: "root-a", status: "completed" },
+          { id: "root-b", status: "inProgress" },
+        ],
+      });
+      const rootCActive = makeThreadReadResponse({
+        status: "active",
+        turns: [
+          { id: "root-a", status: "completed" },
+          { id: "root-b", status: "completed" },
+          { id: "root-c", status: "inProgress" },
+        ],
+      });
+      const idle = makeThreadReadResponse({
+        status: "idle",
+        turns: [
+          { id: "root-a", status: "completed" },
+          { id: "root-b", status: "completed" },
+          { id: "root-c", status: "completed" },
+        ],
+      });
+      const replacement = makeThreadOpenResponse("replacement-thread");
+      const sessionRef = yield* Ref.make<ProviderSession>({
+        provider: ProviderDriverKind.make("codex"),
+        status: "running",
+        runtimeMode: "full-access",
+        threadId: ThreadId.make("t3-thread"),
+        activeTurnId: TurnId.make("root-a"),
+        resumeCursor: { threadId: "source-thread" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      let rewinder!: CodexThreadRewinder;
+      const client = {
+        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+          method: M,
+          payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          if (method === "thread/read") {
+            reads += 1;
+            const response =
+              reads === 1
+                ? initial
+                : sourceSettled
+                  ? idle
+                  : reads === 2
+                    ? rootBActive
+                    : rootCActive;
+            return Effect.succeed(response as CodexRpc.ClientRequestResponsesByMethod[M]);
+          }
+          if (method === "turn/interrupt") {
+            const turnId = (payload as CodexRpc.ClientRequestParamsByMethod["turn/interrupt"])
+              .turnId;
+            interruptedTurns.push(turnId);
+            if (turnId === "root-b") {
+              return Ref.update(sessionRef, (session) => ({
+                ...session,
+                activeTurnId: TurnId.make("root-c"),
+              })).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new CodexErrors.CodexAppServerRequestError({
+                      code: -32602,
+                      errorMessage: "turn is not active",
+                    }),
+                  ),
+                ),
+              );
+            }
+            return Effect.gen(function* () {
+              sourceSettled = true;
+              yield* rewinder.observeTurnCompleted({
+                threadId: "source-thread",
+                turnId: "root-c",
+              });
+              yield* rewinder.observeThreadStatusChanged({
+                threadId: "source-thread",
+                status: { type: "idle" },
+              });
+              return replacement as CodexRpc.ClientRequestResponsesByMethod[M];
+            });
+          }
+          return Effect.succeed(replacement as CodexRpc.ClientRequestResponsesByMethod[M]);
+        },
+      };
+      rewinder = yield* makeCodexThreadRewinder({
+        client,
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        model: undefined,
+        serviceTier: undefined,
+        state: {
+          threadMutationSemaphore: yield* Semaphore.make(1),
+          getSession: Ref.get(sessionRef),
+          drainLiveChildTurnsForRewind: Effect.succeed(new Map()),
+          finishLiveChildTurnSettlement: Effect.void,
+          settlePendingRequests: Effect.void,
+          finishPendingRequestSettlement: Effect.void,
+          rebindProviderThread: () => Effect.void,
+        },
+      });
+
+      const snapshot = yield* rewinder.rewindThread();
+      NodeAssert.deepStrictEqual(interruptedTurns, ["root-b", "root-c"]);
       NodeAssert.equal(snapshot.threadId, "replacement-thread");
     }),
   );
