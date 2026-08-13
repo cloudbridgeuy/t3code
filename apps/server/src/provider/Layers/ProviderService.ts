@@ -1067,6 +1067,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         turns: input.numTurns,
       });
     }).pipe(
+      threadMutationSemaphore.withPermit(input.threadId),
       withMetrics({
         counter: providerTurnsTotal,
         outcomeAttributes: () =>
@@ -1112,13 +1113,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           provider: routed.adapter.provider,
           providerInstanceId: routed.instanceId,
-          status: "running",
+          status: "stopped",
           resumeCursor: replacement.resumeCursor,
           runtimePayload: {
             activeTurnId: null,
             lastRuntimeEvent: "provider.rewindConversation",
             lastRuntimeEventAt: yield* nowIso,
           },
+        });
+        const replacementBinding = Option.getOrUndefined(
+          yield* directory.getBinding(input.threadId),
+        );
+        if (!replacementBinding) {
+          return yield* toValidationError(
+            "ProviderService.rewindConversation",
+            `Cannot recover replacement thread '${input.threadId}' because its persisted provider binding is missing.`,
+          );
+        }
+        yield* recoverSessionForThread({
+          binding: replacementBinding,
+          operation: "ProviderService.rewindConversation",
         });
         yield* analytics.record("provider.conversation.rewound", {
           provider: routed.adapter.provider,

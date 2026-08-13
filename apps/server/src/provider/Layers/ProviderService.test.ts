@@ -93,27 +93,28 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
 
-  const startSession = vi.fn((input: ProviderSessionStartInput) =>
-    Effect.sync(() => {
-      const now = "2026-01-01T00:00:00.000Z";
-      const session: ProviderSession = {
-        provider,
-        ...(input.providerInstanceId !== undefined
-          ? { providerInstanceId: input.providerInstanceId }
-          : {}),
-        status: "ready",
-        runtimeMode: input.runtimeMode,
-        threadId: input.threadId,
-        resumeCursor: input.resumeCursor ?? {
-          opaque: `resume-${String(input.threadId)}`,
-        },
-        cwd: input.cwd ?? process.cwd(),
-        createdAt: now,
-        updatedAt: now,
-      };
-      sessions.set(session.threadId, session);
-      return session;
-    }),
+  const startSession = vi.fn(
+    (input: ProviderSessionStartInput): Effect.Effect<ProviderSession, ProviderAdapterError> =>
+      Effect.sync(() => {
+        const now = "2026-01-01T00:00:00.000Z";
+        const session: ProviderSession = {
+          provider,
+          ...(input.providerInstanceId !== undefined
+            ? { providerInstanceId: input.providerInstanceId }
+            : {}),
+          status: "ready",
+          runtimeMode: input.runtimeMode,
+          threadId: input.threadId,
+          resumeCursor: input.resumeCursor ?? {
+            opaque: `resume-${String(input.threadId)}`,
+          },
+          cwd: input.cwd ?? process.cwd(),
+          createdAt: now,
+          updatedAt: now,
+        };
+        sessions.set(session.threadId, session);
+        return session;
+      }),
   );
 
   const sendTurn = vi.fn(
@@ -209,10 +210,13 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
       },
       ProviderAdapterError
     > =>
-      Effect.succeed({
-        threadId,
-        turns: [{ id: asTurnId("retained-turn"), items: [] }],
-        resumeCursor: { threadId: `replacement-${String(threadId)}` },
+      Effect.sync(() => {
+        sessions.delete(threadId);
+        return {
+          threadId,
+          turns: [{ id: asTurnId("retained-turn"), items: [] }],
+          resumeCursor: { threadId: `replacement-${String(threadId)}` },
+        };
       }),
   );
 
@@ -1007,6 +1011,130 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("persists the replacement cursor before starting its runtime", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-replacement-cursor-order");
+      const modelSelection = createModelSelection(codexInstanceId, "gpt-5.4");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/replacement-project",
+        modelSelection,
+        runtimeMode: "approval-required",
+      });
+
+      const replacementCursor = { threadId: `replacement-${String(threadId)}` };
+      const operationOrder: string[] = [];
+      const rewindImplementation = routing.codex.rewindThread.getMockImplementation();
+      const startImplementation = routing.codex.startSession.getMockImplementation();
+      assert.isDefined(rewindImplementation);
+      assert.isDefined(startImplementation);
+      routing.codex.rewindThread.mockImplementationOnce((routedThreadId, lastTurnId) =>
+        Effect.sync(() => operationOrder.push("rewindThread")).pipe(
+          Effect.andThen(rewindImplementation(routedThreadId, lastTurnId)),
+        ),
+      );
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        Effect.sync(() => operationOrder.push("startSession(replacement cursor)")).pipe(
+          Effect.andThen(startImplementation(input)),
+        ),
+      );
+      const originalUpsert = directory.upsert;
+      const replacement = yield* Effect.acquireUseRelease(
+        Effect.sync(() =>
+          vi.spyOn(directory, "upsert").mockImplementation((binding) =>
+            Effect.sync(() => {
+              operationOrder.push(
+                binding.status === "stopped"
+                  ? "directory.upsert(replacement cursor, stopped)"
+                  : "directory.upsert(running session)",
+              );
+            }).pipe(Effect.andThen(originalUpsert(binding))),
+          ),
+        ),
+        () =>
+          provider.rewindConversation({
+            threadId,
+            lastTurnId: asTurnId("retained-turn"),
+          }),
+        (upsertSpy) => Effect.sync(() => upsertSpy.mockRestore()),
+      );
+
+      assert.deepEqual(replacement.resumeCursor, replacementCursor);
+      assert.deepEqual(operationOrder, [
+        "rewindThread",
+        "directory.upsert(replacement cursor, stopped)",
+        "startSession(replacement cursor)",
+        "directory.upsert(running session)",
+      ]);
+      assert.deepEqual(routing.codex.startSession.mock.calls.at(-1)?.[0], {
+        threadId,
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        cwd: "/tmp/replacement-project",
+        modelSelection,
+        resumeCursor: replacementCursor,
+        runtimeMode: "approval-required",
+      });
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("keeps the replacement cursor when replacement startup fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-replacement-cursor-start-failure");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/replacement-failure-project",
+        runtimeMode: "full-access",
+      });
+      const analytics = yield* AnalyticsService.AnalyticsService;
+      const recordSpy = vi.spyOn(analytics, "record");
+      routing.codex.startSession.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "startSession",
+            detail: "simulated replacement startup failure",
+          }),
+        ),
+      );
+
+      const error = yield* provider.rewindConversation({ threadId }).pipe(
+        Effect.flip,
+        Effect.tap(() =>
+          Effect.sync(() => {
+            assert.equal(
+              recordSpy.mock.calls.some(([event]) => event === "provider.conversation.rewound"),
+              false,
+            );
+          }),
+        ),
+        Effect.ensuring(Effect.sync(() => recordSpy.mockRestore())),
+      );
+      assert.instanceOf(error, ProviderAdapterRequestError);
+      const replacementCursor = { threadId: `replacement-${String(threadId)}` };
+      const persisted = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(persisted?.status, "stopped");
+      assert.deepEqual(persisted?.resumeCursor, replacementCursor);
+
+      routing.codex.startSession.mockClear();
+      yield* provider.sendTurn({ threadId, input: "recover replacement", attachments: [] });
+      assert.deepEqual(
+        routing.codex.startSession.mock.calls[0]?.[0]?.resumeCursor,
+        replacementCursor,
+      );
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
   it.effect("serializes rewind persistence with a concurrent send", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1021,16 +1149,15 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
       const rewindEntered = yield* Deferred.make<void>();
       const allowRewind = yield* Deferred.make<void>();
-      routing.codex.rewindThread.mockImplementationOnce((routedThreadId) =>
+      const rewindImplementation = routing.codex.rewindThread.getMockImplementation();
+      assert.isDefined(rewindImplementation);
+      routing.codex.rewindThread.mockImplementationOnce((routedThreadId, lastTurnId) =>
         Deferred.succeed(rewindEntered, undefined).pipe(
           Effect.andThen(Deferred.await(allowRewind)),
-          Effect.as({
-            threadId: routedThreadId,
-            turns: [],
-            resumeCursor: { threadId: "replacement-thread" },
-          }),
+          Effect.andThen(rewindImplementation(routedThreadId, lastTurnId)),
         ),
       );
+      routing.codex.startSession.mockClear();
       routing.codex.sendTurn.mockClear();
 
       const rewindFiber = yield* provider.rewindConversation({ threadId }).pipe(Effect.forkChild);
@@ -1043,8 +1170,12 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       yield* Deferred.succeed(allowRewind, undefined);
       yield* Fiber.join(rewindFiber);
+      assert.equal(routing.codex.startSession.mock.calls.length, 1);
       const turn = yield* Fiber.join(sendFiber);
       const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.deepEqual(binding?.resumeCursor, {
+        threadId: `replacement-${String(threadId)}`,
+      });
       assert.equal(
         (binding?.runtimePayload as { activeTurnId?: unknown } | undefined)?.activeTurnId,
         turn.turnId,
@@ -1067,16 +1198,15 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
       const rewindEntered = yield* Deferred.make<void>();
       const allowRewind = yield* Deferred.make<void>();
-      routing.codex.rewindThread.mockImplementationOnce((routedThreadId) =>
+      const rewindImplementation = routing.codex.rewindThread.getMockImplementation();
+      assert.isDefined(rewindImplementation);
+      routing.codex.rewindThread.mockImplementationOnce((routedThreadId, lastTurnId) =>
         Deferred.succeed(rewindEntered, undefined).pipe(
           Effect.andThen(Deferred.await(allowRewind)),
-          Effect.as({
-            threadId: routedThreadId,
-            turns: [],
-            resumeCursor: { threadId: "replacement-thread" },
-          }),
+          Effect.andThen(rewindImplementation(routedThreadId, lastTurnId)),
         ),
       );
+      routing.codex.startSession.mockClear();
       routing.codex.stopSession.mockClear();
 
       const rewindFiber = yield* provider.rewindConversation({ threadId }).pipe(Effect.forkChild);
@@ -1087,13 +1217,56 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       yield* Deferred.succeed(allowRewind, undefined);
       yield* Fiber.join(rewindFiber);
+      assert.equal(routing.codex.startSession.mock.calls.length, 1);
       yield* Fiber.join(stopFiber);
       const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
       assert.equal(binding?.status, "stopped");
+      assert.deepEqual(binding?.resumeCursor, {
+        threadId: `replacement-${String(threadId)}`,
+      });
       assert.equal(
         (binding?.runtimePayload as { activeTurnId?: unknown } | undefined)?.activeTurnId,
         null,
       );
+    }),
+  );
+
+  it.effect("serializes rollback with a concurrent rewind", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-rewind-rollback-race");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+      const rewindEntered = yield* Deferred.make<void>();
+      const allowRewind = yield* Deferred.make<void>();
+      const rewindImplementation = routing.codex.rewindThread.getMockImplementation();
+      assert.isDefined(rewindImplementation);
+      routing.codex.rewindThread.mockImplementationOnce((routedThreadId, lastTurnId) =>
+        Deferred.succeed(rewindEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowRewind)),
+          Effect.andThen(rewindImplementation(routedThreadId, lastTurnId)),
+        ),
+      );
+      routing.codex.rollbackThread.mockClear();
+
+      const rewindFiber = yield* provider.rewindConversation({ threadId }).pipe(Effect.forkChild);
+      yield* Deferred.await(rewindEntered);
+      const rollbackFiber = yield* provider
+        .rollbackConversation({ threadId, numTurns: 1 })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(routing.codex.rollbackThread.mock.calls.length, 0);
+
+      yield* Deferred.succeed(allowRewind, undefined);
+      yield* Fiber.join(rewindFiber);
+      yield* Fiber.join(rollbackFiber);
+      assert.deepEqual(routing.codex.rollbackThread.mock.calls, [[threadId, 1]]);
+      yield* provider.stopSession({ threadId });
     }),
   );
 
