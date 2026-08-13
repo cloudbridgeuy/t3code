@@ -55,7 +55,7 @@ import {
   reportMarkdownActionFailure,
 } from "./chat/MarkdownCodeBlock";
 import { MermaidBlock } from "./chat/MermaidBlock";
-import { isMermaidFence } from "./chat/mermaidBlock.logic";
+import { isFenceClosed, isMermaidFence } from "./chat/mermaidBlock.logic";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "./ui/collapsible";
@@ -1501,7 +1501,7 @@ function ChatMarkdown({
           </RenderErrorBoundary>
         );
 
-        if (isMermaidFence(language) && !isStreaming) {
+        if (isMermaidFence(language)) {
           return (
             <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
               <MermaidBlock
@@ -1509,6 +1509,7 @@ function ChatMarkdown({
                 fenceTitle={fenceTitle}
                 theme={resolvedTheme}
                 sourceView={shikiElement}
+                fenceClosed={isFenceClosed(text, node?.position, isStreaming)}
               />
             </RenderErrorBoundary>
           );

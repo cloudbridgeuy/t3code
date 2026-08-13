@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { isMermaidFence, mermaidFailureMessage, resolveMermaidView } from "./mermaidBlock.logic";
+import {
+  isFenceClosed,
+  isMermaidFence,
+  mermaidFailureMessage,
+  resolveMermaidView,
+} from "./mermaidBlock.logic";
 
 describe("isMermaidFence", () => {
   it("accepts the mermaid fence language", () => {
@@ -41,6 +46,7 @@ describe("resolveMermaidView", () => {
     const view = resolveMermaidView({
       prefersSource: true,
       renderState: { status: "rendered", svg: "<svg>ready</svg>" },
+      fenceClosed: true,
     });
     expect(view).toEqual({ _tag: "Source" });
   });
@@ -49,6 +55,7 @@ describe("resolveMermaidView", () => {
     const view = resolveMermaidView({
       prefersSource: true,
       renderState: { status: "pending" },
+      fenceClosed: true,
     });
     expect(view).toEqual({ _tag: "Source" });
   });
@@ -57,6 +64,7 @@ describe("resolveMermaidView", () => {
     const view = resolveMermaidView({
       prefersSource: false,
       renderState: { status: "pending" },
+      fenceClosed: true,
     });
     expect(view).toEqual({ _tag: "Pending" });
   });
@@ -65,6 +73,7 @@ describe("resolveMermaidView", () => {
     const view = resolveMermaidView({
       prefersSource: false,
       renderState: { status: "rendered", svg: "<svg>diagram</svg>" },
+      fenceClosed: true,
     });
     expect(view).toEqual({ _tag: "Diagram", svg: "<svg>diagram</svg>" });
   });
@@ -73,6 +82,7 @@ describe("resolveMermaidView", () => {
     const view = resolveMermaidView({
       prefersSource: false,
       renderState: { status: "failed", message: "Parse error on line 1" },
+      fenceClosed: true,
     });
     expect(view).toEqual({ _tag: "Failed", message: "Parse error on line 1" });
   });
@@ -84,6 +94,7 @@ describe("resolveMermaidView", () => {
     const view = resolveMermaidView({
       prefersSource: false,
       renderState: { status: "failed", message: "boom" },
+      fenceClosed: true,
     });
     expect(view._tag).not.toBe("Diagram");
   });
@@ -92,8 +103,92 @@ describe("resolveMermaidView", () => {
     const view = resolveMermaidView({
       prefersSource: true,
       renderState: { status: "failed", message: "boom" },
+      fenceClosed: true,
     });
     expect(view).toEqual({ _tag: "Source" });
+  });
+
+  it("shows Pending while the fence is still open, regardless of renderState", () => {
+    // A block still streaming in has no complete diagram source to render —
+    // an open fence always reads as Pending, even if a stale renderState
+    // says otherwise (which should not happen in practice, but the pure
+    // function does not trust the fence to stay closed once opened).
+    const view = resolveMermaidView({
+      prefersSource: false,
+      renderState: { status: "rendered", svg: "<svg>stale</svg>" },
+      fenceClosed: false,
+    });
+    expect(view).toEqual({ _tag: "Pending" });
+  });
+
+  it("shows Pending while the fence is open even if the render already failed", () => {
+    const view = resolveMermaidView({
+      prefersSource: false,
+      renderState: { status: "failed", message: "boom" },
+      fenceClosed: false,
+    });
+    expect(view).toEqual({ _tag: "Pending" });
+  });
+
+  it("shows Source when the user prefers source, even while the fence is still open", () => {
+    const view = resolveMermaidView({
+      prefersSource: true,
+      renderState: { status: "pending" },
+      fenceClosed: false,
+    });
+    expect(view).toEqual({ _tag: "Source" });
+  });
+
+  it("Failed keeps the source visible: it never resolves to Diagram, with or without an open fence", () => {
+    const closed = resolveMermaidView({
+      prefersSource: false,
+      renderState: { status: "failed", message: "boom" },
+      fenceClosed: true,
+    });
+    const open = resolveMermaidView({
+      prefersSource: false,
+      renderState: { status: "failed", message: "boom" },
+      fenceClosed: false,
+    });
+    expect(closed._tag).not.toBe("Diagram");
+    expect(open._tag).not.toBe("Diagram");
+  });
+});
+
+describe("isFenceClosed", () => {
+  // `fenceStart` mirrors what remark reports as `position.start.offset` for
+  // a fenced code node: the offset of the fence's opening backtick run.
+  const fenceStart = "before\n\n".length;
+
+  it("is false for an open fence still streaming in (cut short by end of text)", () => {
+    const text = "before\n\n```mermaid\ngraph TD\nA-->B";
+    // Unterminated: remark extends the node's end to the end of input.
+    const position = { start: { offset: fenceStart }, end: { offset: text.length } };
+    expect(isFenceClosed(text, position, true)).toBe(false);
+  });
+
+  it("is true for a closed fence with content after it", () => {
+    const closedFence = "```mermaid\ngraph TD\nA-->B\n```";
+    const text = `before\n\n${closedFence}\n\nafter`;
+    // Closed: remark's end offset lands right after the closing fence,
+    // before the trailing blank line and "after".
+    const position = {
+      start: { offset: fenceStart },
+      end: { offset: fenceStart + closedFence.length },
+    };
+    expect(isFenceClosed(text, position, true)).toBe(true);
+  });
+
+  it("is true for a fence whose closing marker is the very last text in the message", () => {
+    const text = "before\n\n```mermaid\ngraph TD\nA-->B\n```";
+    const position = { start: { offset: fenceStart }, end: { offset: text.length } };
+    expect(isFenceClosed(text, position, true)).toBe(true);
+  });
+
+  it("falls back to !isStreaming when the position is missing", () => {
+    const text = "```mermaid\ngraph TD\nA-->B";
+    expect(isFenceClosed(text, undefined, true)).toBe(false);
+    expect(isFenceClosed(text, undefined, false)).toBe(true);
   });
 });
 

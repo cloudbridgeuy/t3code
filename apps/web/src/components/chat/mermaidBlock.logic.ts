@@ -14,6 +14,52 @@ export function isMermaidFence(language: string): boolean {
   return language.trim().toLowerCase() === MERMAID_FENCE_LANGUAGE;
 }
 
+/** Minimal shape of a hast/mdast node's `position` — enough to check whether
+ * a fence's closing marker has arrived, and structurally compatible with the
+ * real (richer) `Position` type react-markdown hands its component
+ * overrides. Matches the pattern ChatMarkdown's `li` override already uses
+ * for `node?.position?.start.offset`. */
+export interface MermaidFencePosition {
+  readonly start?: { readonly offset?: number | undefined };
+  readonly end?: { readonly offset?: number | undefined };
+}
+
+const FENCE_MARKER_PATTERN = /^(`{3,}|~{3,})/;
+
+/**
+ * Whether the mermaid fence `position` spans has a closing marker already in
+ * `text`, as opposed to having been cut short by the end of a still-streaming
+ * message. An unterminated fenced code block is extended by the markdown
+ * parser all the way to the end of input, so the raw slice from
+ * `position.start` to `position.end` ends with real code — never a bare run
+ * of backticks or tildes — until the closing fence has actually arrived.
+ *
+ * When `position` (or either offset) is missing, there is nothing to check
+ * against, so this falls back to `!isStreaming` — byte-for-byte V1's
+ * behavior: a finished message can never have an open fence, and a
+ * still-streaming one might.
+ */
+export function isFenceClosed(
+  text: string,
+  position: MermaidFencePosition | undefined,
+  isStreaming: boolean,
+): boolean {
+  const start = position?.start?.offset;
+  const end = position?.end?.offset;
+  if (start == null || end == null) {
+    return !isStreaming;
+  }
+  const lines = text.slice(start, end).split("\n");
+  const openingFence = FENCE_MARKER_PATTERN.exec(lines[0] ?? "");
+  const openingMarker = openingFence?.[1];
+  if (!openingMarker || lines.length < 2) {
+    return !isStreaming;
+  }
+  const closingLine = (lines[lines.length - 1] ?? "").trim();
+  const closingPattern = openingMarker[0] === "~" ? /^~{3,}$/ : /^`{3,}$/;
+  return closingPattern.test(closingLine) && closingLine.length >= openingMarker.length;
+}
+
 /** How far the diagram render has gotten: no SVG yet, a rendered SVG in
  * hand, or the render failed and will not be retried on its own. */
 export type MermaidRenderState =
@@ -41,18 +87,25 @@ export const MermaidView = {
 } as const;
 
 /**
- * The user's explicit choice to see source always wins. Otherwise the view
- * follows the render: no SVG yet reads as `Pending` (presented as the same
- * code block as `Source`, so the user never sees an empty box), an SVG in
- * hand reads as `Diagram`, and a failure reads as `Failed` — currently
- * presented as the source view too, since there is no failure notice UI yet.
+ * The user's explicit choice to see source always wins. Otherwise, while the
+ * fence is still open (streaming in), the view is always `Pending` —
+ * regardless of `renderState` — since there is no complete diagram source to
+ * render yet and no attempt should be made to render one. Once the fence has
+ * closed, the view follows the render: no SVG yet reads as `Pending`
+ * (presented as the same code block as `Source`, so the user never sees an
+ * empty box or a spinner claiming work that isn't happening), an SVG in hand
+ * reads as `Diagram`, and a failure reads as `Failed`.
  */
 export function resolveMermaidView(input: {
   readonly prefersSource: boolean;
   readonly renderState: MermaidRenderState;
+  readonly fenceClosed: boolean;
 }): MermaidView {
   if (input.prefersSource) {
     return MermaidView.Source();
+  }
+  if (!input.fenceClosed) {
+    return MermaidView.Pending();
   }
   switch (input.renderState.status) {
     case "rendered":

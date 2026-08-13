@@ -1,5 +1,10 @@
 import type { Mermaid } from "mermaid";
 
+import {
+  mermaidFailureMessage,
+  type MermaidRenderState,
+} from "../components/chat/mermaidBlock.logic";
+
 /**
  * Mermaid bundles its own layout engines and is large, so it is fetched at
  * most once, lazily, on the first diagram — mirroring the highlighter cache
@@ -38,9 +43,12 @@ function ensureInitialized(mermaid: Mermaid, theme: "light" | "dark"): void {
   }
   mermaid.initialize({
     startOnLoad: false,
-    // Strict mode disables HTML labels and sanitizes mermaid's own SVG
-    // output, which is what makes injecting that output via
-    // dangerouslySetInnerHTML safe for untrusted agent-authored diagram text.
+    // Strict mode sanitizes mermaid's own SVG output — a real rendered SVG
+    // was inspected and confirmed an injected <script> element was stripped
+    // outright — which is what makes injecting that output via
+    // dangerouslySetInnerHTML safe for untrusted agent-authored diagram
+    // text. It does not disable HTML labels: those still render as real
+    // HTML (<div>/<p>) inside <foreignObject>.
     securityLevel: "strict",
     theme: mermaidThemeFor(theme),
   });
@@ -50,17 +58,25 @@ function ensureInitialized(mermaid: Mermaid, theme: "light" | "dark"): void {
 let renderIdCounter = 0;
 
 /** Loads mermaid, initializes it for `theme`, and renders `source` to SVG
- * markup. Throws (never resolves to an error value) on invalid diagram text
- * or a load failure — callers that need to isolate that from the rest of the
- * page should catch it or wrap the caller in a React error boundary. */
+ * markup. Invalid diagram text is a normal outcome for agent-authored
+ * streaming content, not an exception, so a `parse()` rejection comes back
+ * as a `"failed"` value instead of propagating. A genuine loader or render
+ * failure (bad chunk, offline, an error `parse()` didn't catch) is a
+ * different thing and still throws — callers that need to isolate that from
+ * the rest of the page should catch it or wrap the caller in a React error
+ * boundary. */
 export async function renderMermaidDiagram(
   source: string,
   theme: "light" | "dark",
-): Promise<string> {
+): Promise<Extract<MermaidRenderState, { status: "rendered" | "failed" }>> {
   const mermaid = await loadMermaidModule();
   ensureInitialized(mermaid, theme);
-  await mermaid.parse(source);
+  try {
+    await mermaid.parse(source);
+  } catch (error) {
+    return { status: "failed", message: mermaidFailureMessage(error) };
+  }
   const id = `mermaid-diagram-${renderIdCounter++}`;
   const { svg } = await mermaid.render(id, source);
-  return svg;
+  return { status: "rendered", svg };
 }
