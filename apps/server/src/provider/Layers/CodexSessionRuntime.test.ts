@@ -2,9 +2,20 @@ import * as NodeAssert from "node:assert/strict";
 
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import { describe } from "vite-plus/test";
-import { DEFAULT_MODEL, ThreadId } from "@t3tools/contracts";
+import {
+  DEFAULT_MODEL,
+  ApprovalRequestId,
+  ProviderDriverKind,
+  ProviderItemId,
+  type ProviderSession,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
 
@@ -18,7 +29,15 @@ import {
   buildTurnStartParams,
   hasConfiguredMcpServer,
   isRecoverableThreadResumeError,
+  makeCodexThreadRewinder,
+  makeCodexApprovalDecisionEvent,
+  makeCodexPendingRequestStore,
+  makeCodexUserInputAnsweredEvent,
   openCodexThread,
+  resolveActiveCodexTurnId,
+  resolveCodexRewindPlan,
+  resolveCodexRewindWaitPlan,
+  toCodexUserInputAnswers,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
 
@@ -60,6 +79,38 @@ function makeThreadOpenResponse(
       },
     },
   } as unknown as CodexRpc.ClientRequestResponsesByMethod["thread/start"];
+}
+
+function makeThreadReadResponse(input: {
+  readonly status: "idle" | "active";
+  readonly turns: ReadonlyArray<{
+    readonly id: string;
+    readonly status: "completed" | "inProgress";
+  }>;
+}): CodexRpc.ClientRequestResponsesByMethod["thread/read"] {
+  const opened = makeThreadOpenResponse("source-thread");
+  return {
+    thread: {
+      ...opened.thread,
+      status: input.status === "idle" ? { type: "idle" } : { type: "active", activeFlags: [] },
+      turns: input.turns.map((turn) => ({ ...turn, items: [] })),
+    },
+  } as unknown as CodexRpc.ClientRequestResponsesByMethod["thread/read"];
+}
+
+function makeThreadForkResponse(
+  threadId: string,
+  turns: ReadonlyArray<{ readonly id: string; readonly status: "completed" }> = [],
+): CodexRpc.ClientRequestResponsesByMethod["thread/fork"] {
+  const opened = makeThreadOpenResponse(threadId);
+  return {
+    ...opened,
+    thread: {
+      ...opened.thread,
+      id: threadId,
+      turns: turns.map((turn) => ({ ...turn, items: [] })),
+    },
+  } as unknown as CodexRpc.ClientRequestResponsesByMethod["thread/fork"];
 }
 
 describe("buildTurnStartParams", () => {
@@ -390,6 +441,502 @@ describe("isRecoverableThreadResumeError", () => {
       false,
     );
   });
+});
+
+describe("resolveCodexRewindPlan", () => {
+  const turns = [
+    { id: "completed-turn", status: "completed" },
+    { id: "active-turn", status: "inProgress" },
+  ] as const;
+
+  it("starts a fresh thread when no turn is retained", () => {
+    NodeAssert.deepStrictEqual(resolveCodexRewindPlan(turns, undefined), { _tag: "start" });
+  });
+
+  it("forks through the requested completed turn", () => {
+    NodeAssert.deepStrictEqual(resolveCodexRewindPlan(turns, TurnId.make("completed-turn")), {
+      _tag: "fork",
+      lastTurnId: "completed-turn",
+    });
+  });
+
+  it("rejects a retained turn that is missing or still active", () => {
+    NodeAssert.deepStrictEqual(resolveCodexRewindPlan(turns, TurnId.make("missing-turn")), {
+      _tag: "invalid",
+      turnId: "missing-turn",
+      reason: "not-found",
+    });
+    NodeAssert.deepStrictEqual(resolveCodexRewindPlan(turns, TurnId.make("active-turn")), {
+      _tag: "invalid",
+      turnId: "active-turn",
+      reason: "not-completed",
+    });
+  });
+});
+
+describe("resolveActiveCodexTurnId", () => {
+  const turns = [
+    { id: "completed-turn", status: "completed" },
+    { id: "active-turn", status: "inProgress" },
+  ] as const;
+
+  it("uses the runtime active turn before the thread snapshot", () => {
+    NodeAssert.equal(
+      resolveActiveCodexTurnId(turns, TurnId.make("runtime-active-turn")),
+      "runtime-active-turn",
+    );
+  });
+
+  it("falls back to the last in-progress snapshot turn", () => {
+    NodeAssert.equal(resolveActiveCodexTurnId(turns, undefined), "active-turn");
+    NodeAssert.equal(resolveActiveCodexTurnId(turns.slice(0, 1), undefined), undefined);
+  });
+});
+
+describe("resolveCodexRewindWaitPlan", () => {
+  const turns = [
+    { id: "completed-turn", status: "completed" },
+    { id: "active-turn", status: "inProgress" },
+  ] as const;
+
+  it("waits for the runtime active turn and a non-idle source thread", () => {
+    NodeAssert.deepStrictEqual(
+      resolveCodexRewindWaitPlan({
+        turns,
+        sourceStatus: "active",
+        sessionActiveTurnId: TurnId.make("runtime-active-turn"),
+      }),
+      {
+        _tag: "ready",
+        rootTurnId: "runtime-active-turn",
+        waitForRootCompletion: true,
+        waitForSourceIdle: true,
+      },
+    );
+  });
+
+  it("skips waiters when the source is idle and no active turn remains", () => {
+    NodeAssert.deepStrictEqual(
+      resolveCodexRewindWaitPlan({
+        turns: turns.slice(0, 1),
+        sourceStatus: "idle",
+        sessionActiveTurnId: undefined,
+      }),
+      {
+        _tag: "ready",
+        rootTurnId: undefined,
+        waitForRootCompletion: false,
+        waitForSourceIdle: false,
+      },
+    );
+  });
+
+  it.each(["systemError", "notLoaded"])(
+    "does not wait for terminal source status %s",
+    (sourceStatus) => {
+      NodeAssert.deepStrictEqual(
+        resolveCodexRewindWaitPlan({
+          turns: turns.slice(0, 1),
+          sourceStatus,
+          sessionActiveTurnId: undefined,
+        }),
+        {
+          _tag: "ready",
+          rootTurnId: undefined,
+          waitForRootCompletion: false,
+          waitForSourceIdle: false,
+        },
+      );
+    },
+  );
+
+  it("rejects an active source without an active root turn", () => {
+    NodeAssert.deepStrictEqual(
+      resolveCodexRewindWaitPlan({
+        turns: turns.slice(0, 1),
+        sourceStatus: "active",
+        sessionActiveTurnId: undefined,
+      }),
+      {
+        _tag: "invalid",
+        rootTurnId: undefined,
+        waitForRootCompletion: false,
+        waitForSourceIdle: false,
+      },
+    );
+  });
+});
+
+describe("Codex pending request resolution events", () => {
+  const threadId = ThreadId.make("t3-thread");
+  const requestId = ApprovalRequestId.make("request-1");
+  const turnId = TurnId.make("turn-1");
+  const itemId = ProviderItemId.make("item-1");
+
+  it("builds the canonical approval cancellation event", () => {
+    NodeAssert.deepStrictEqual(
+      makeCodexApprovalDecisionEvent({
+        threadId,
+        pending: { requestId, requestKind: "command", turnId, itemId },
+        decision: "cancel",
+      }),
+      {
+        kind: "notification",
+        threadId,
+        method: "item/requestApproval/decision",
+        requestId,
+        requestKind: "command",
+        turnId,
+        itemId,
+        payload: { requestId, requestKind: "command", decision: "cancel" },
+      },
+    );
+  });
+
+  it("builds the canonical empty structured-input answer event", () => {
+    NodeAssert.deepStrictEqual(
+      makeCodexUserInputAnsweredEvent({
+        threadId,
+        pending: { requestId, turnId, itemId },
+        answers: {},
+      }),
+      {
+        kind: "notification",
+        threadId,
+        method: "item/tool/requestUserInput/answered",
+        requestId,
+        turnId,
+        itemId,
+        payload: { answers: {} },
+      },
+    );
+  });
+});
+
+describe("makeCodexPendingRequestStore", () => {
+  it.effect("atomically drains existing requests and rejects late registration", () =>
+    Effect.gen(function* () {
+      const store = yield* makeCodexPendingRequestStore<string>();
+      const firstId = ApprovalRequestId.make("first");
+      const lateId = ApprovalRequestId.make("late");
+      NodeAssert.equal(yield* store.register(firstId, "first request"), false);
+
+      NodeAssert.deepStrictEqual(yield* store.drainForRewind, ["first request"]);
+      NodeAssert.equal(yield* store.register(lateId, "late request"), true);
+      NodeAssert.equal(yield* store.take(lateId), undefined);
+
+      yield* store.finishRewind;
+      NodeAssert.equal(yield* store.register(lateId, "after rewind"), false);
+      NodeAssert.equal(yield* store.take(lateId), "after rewind");
+    }),
+  );
+
+  it.effect("keeps a pending request when structured-input validation fails", () =>
+    Effect.gen(function* () {
+      const store = yield* makeCodexPendingRequestStore<string>();
+      const requestId = ApprovalRequestId.make("request-with-invalid-answer");
+      yield* store.register(requestId, "pending request");
+
+      const error = yield* toCodexUserInputAnswers({ question: 42 }).pipe(Effect.flip);
+      NodeAssert.equal(error._tag, "CodexSessionRuntimeInvalidUserInputAnswersError");
+      NodeAssert.equal(yield* store.take(requestId), "pending request");
+    }),
+  );
+});
+
+describe("makeCodexThreadRewinder", () => {
+  it.effect(
+    "settles requests, interrupts child and root, waits for root and idle, then forks",
+    () =>
+      Effect.gen(function* () {
+        const calls: Array<string> = [];
+        const rootInterruptSent = yield* Deferred.make<void>();
+        const source = makeThreadReadResponse({
+          status: "active",
+          turns: [
+            { id: "retained-turn", status: "completed" },
+            { id: "active-turn", status: "inProgress" },
+          ],
+        });
+        const replacement = makeThreadForkResponse("replacement-thread", [
+          { id: "retained-turn", status: "completed" },
+        ]);
+        const rebound: Array<{ threadId: string; cwd: string; model: string }> = [];
+        const client = {
+          request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+            method: M,
+            payload: CodexRpc.ClientRequestParamsByMethod[M],
+          ) => {
+            if (method === "thread/read") {
+              calls.push("read");
+              return Effect.succeed(source as CodexRpc.ClientRequestResponsesByMethod[M]);
+            }
+            if (method === "turn/interrupt") {
+              const interrupt = payload as CodexRpc.ClientRequestParamsByMethod["turn/interrupt"];
+              calls.push(`interrupt:${interrupt.threadId}:${interrupt.turnId}`);
+              if (interrupt.threadId === "source-thread") {
+                return Deferred.succeed(rootInterruptSent, undefined).pipe(
+                  Effect.as(replacement as CodexRpc.ClientRequestResponsesByMethod[M]),
+                );
+              }
+              return Effect.succeed(replacement as CodexRpc.ClientRequestResponsesByMethod[M]);
+            }
+            calls.push(method === "thread/fork" ? "fork" : "start");
+            return Effect.succeed(replacement as CodexRpc.ClientRequestResponsesByMethod[M]);
+          },
+        };
+        const session: ProviderSession = {
+          provider: ProviderDriverKind.make("codex"),
+          status: "running",
+          runtimeMode: "full-access",
+          threadId: ThreadId.make("t3-thread"),
+          activeTurnId: TurnId.make("active-turn"),
+          resumeCursor: { threadId: "source-thread" },
+          cwd: "/tmp/project",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+        const rewinder = yield* makeCodexThreadRewinder({
+          client,
+          runtimeMode: "full-access",
+          cwd: "/tmp/project",
+          model: "gpt-5.3-codex",
+          serviceTier: undefined,
+          state: {
+            threadMutationSemaphore: yield* Semaphore.make(1),
+            getSession: Effect.succeed(session),
+            getLiveChildTurns: Effect.succeed(new Map([["child-thread", "child-turn"]])),
+            settlePendingRequests: Effect.sync(() => calls.push("settle-pending")),
+            finishPendingRequestSettlement: Effect.void,
+            rebindProviderThread: (input) =>
+              Effect.sync(() => {
+                calls.push("rebind");
+                rebound.push(input);
+              }),
+          },
+        });
+
+        const rewindFiber = yield* rewinder
+          .rewindThread(TurnId.make("retained-turn"))
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(rootInterruptSent);
+        NodeAssert.deepStrictEqual(calls, [
+          "read",
+          "settle-pending",
+          "interrupt:child-thread:child-turn",
+          "interrupt:source-thread:active-turn",
+        ]);
+
+        yield* rewinder.observeTurnCompleted({
+          threadId: "foreign-thread",
+          turnId: "active-turn",
+        });
+        yield* rewinder.observeThreadStatusChanged({
+          threadId: "source-thread",
+          status: { type: "idle" },
+        });
+        yield* Effect.yieldNow;
+        NodeAssert.equal(rewindFiber.pollUnsafe(), undefined);
+
+        yield* rewinder.observeTurnCompleted({
+          threadId: "source-thread",
+          turnId: "active-turn",
+        });
+        const snapshot = yield* Fiber.join(rewindFiber);
+
+        NodeAssert.deepStrictEqual(calls, [
+          "read",
+          "settle-pending",
+          "interrupt:child-thread:child-turn",
+          "interrupt:source-thread:active-turn",
+          "fork",
+          "rebind",
+        ]);
+        NodeAssert.equal(snapshot.threadId, "replacement-thread");
+        NodeAssert.deepStrictEqual(
+          snapshot.turns.map((turn) => turn.id),
+          ["retained-turn"],
+        );
+        NodeAssert.deepStrictEqual(rebound, [
+          {
+            threadId: "replacement-thread",
+            cwd: "/tmp/project",
+            model: "gpt-5.3-codex",
+          },
+        ]);
+      }),
+  );
+
+  it.effect("starts a fresh replacement before the first retained turn", () =>
+    Effect.gen(function* () {
+      const calls: Array<string> = [];
+      const source = makeThreadReadResponse({ status: "idle", turns: [] });
+      const replacement = makeThreadOpenResponse("fresh-thread");
+      const client = {
+        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+          method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push(method);
+          return Effect.succeed(
+            (method === "thread/read"
+              ? source
+              : replacement) as CodexRpc.ClientRequestResponsesByMethod[M],
+          );
+        },
+      };
+      const rewinder = yield* makeCodexThreadRewinder({
+        client,
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        model: undefined,
+        serviceTier: undefined,
+        state: {
+          threadMutationSemaphore: yield* Semaphore.make(1),
+          getSession: Effect.succeed({
+            provider: ProviderDriverKind.make("codex"),
+            status: "ready",
+            runtimeMode: "full-access",
+            threadId: ThreadId.make("t3-thread"),
+            resumeCursor: { threadId: "source-thread" },
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          }),
+          getLiveChildTurns: Effect.succeed(new Map()),
+          settlePendingRequests: Effect.void,
+          finishPendingRequestSettlement: Effect.void,
+          rebindProviderThread: () => Effect.void,
+        },
+      });
+
+      const snapshot = yield* rewinder.rewindThread();
+      NodeAssert.equal(snapshot.threadId, "fresh-thread");
+      NodeAssert.deepStrictEqual(calls, ["thread/read", "thread/start"]);
+    }),
+  );
+
+  it.effect("rejects an invalid retained turn before settlement or interruption", () =>
+    Effect.gen(function* () {
+      const calls: Array<string> = [];
+      const source = makeThreadReadResponse({ status: "idle", turns: [] });
+      const client = {
+        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+          method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push(method);
+          return Effect.succeed(source as CodexRpc.ClientRequestResponsesByMethod[M]);
+        },
+      };
+      const rewinder = yield* makeCodexThreadRewinder({
+        client,
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        model: undefined,
+        serviceTier: undefined,
+        state: {
+          threadMutationSemaphore: yield* Semaphore.make(1),
+          getSession: Effect.succeed({
+            provider: ProviderDriverKind.make("codex"),
+            status: "ready",
+            runtimeMode: "full-access",
+            threadId: ThreadId.make("t3-thread"),
+            resumeCursor: { threadId: "source-thread" },
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          }),
+          getLiveChildTurns: Effect.succeed(new Map()),
+          settlePendingRequests: Effect.sync(() => calls.push("settle-pending")),
+          finishPendingRequestSettlement: Effect.void,
+          rebindProviderThread: () => Effect.void,
+        },
+      });
+
+      const error = yield* rewinder.rewindThread(TurnId.make("missing-turn")).pipe(Effect.flip);
+      NodeAssert.equal(error._tag, "CodexSessionRuntimeInvalidRetainedTurnError");
+      NodeAssert.deepStrictEqual(calls, ["thread/read"]);
+    }),
+  );
+
+  it.effect("serializes concurrent rewinds and other thread mutations", () =>
+    Effect.gen(function* () {
+      const calls: Array<string> = [];
+      const firstReplacementAllowed = yield* Deferred.make<void>();
+      const firstReplacementRequested = yield* Deferred.make<void>();
+      const semaphore = yield* Semaphore.make(1);
+      let startCount = 0;
+      const source = makeThreadReadResponse({ status: "idle", turns: [] });
+      const replacement = makeThreadOpenResponse("replacement-thread");
+      const client = {
+        request: <M extends "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start">(
+          method: M,
+          _payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push(method);
+          if (method === "thread/read") {
+            return Effect.succeed(source as CodexRpc.ClientRequestResponsesByMethod[M]);
+          }
+          if (method === "thread/start") {
+            startCount += 1;
+            if (startCount === 1) {
+              return Deferred.succeed(firstReplacementRequested, undefined).pipe(
+                Effect.andThen(Deferred.await(firstReplacementAllowed)),
+                Effect.as(replacement as CodexRpc.ClientRequestResponsesByMethod[M]),
+              );
+            }
+          }
+          return Effect.succeed(replacement as CodexRpc.ClientRequestResponsesByMethod[M]);
+        },
+      };
+      const session: ProviderSession = {
+        provider: ProviderDriverKind.make("codex"),
+        status: "ready",
+        runtimeMode: "full-access",
+        threadId: ThreadId.make("t3-thread"),
+        resumeCursor: { threadId: "source-thread" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      const rewinder = yield* makeCodexThreadRewinder({
+        client,
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        model: undefined,
+        serviceTier: undefined,
+        state: {
+          threadMutationSemaphore: semaphore,
+          getSession: Effect.succeed(session),
+          getLiveChildTurns: Effect.succeed(new Map()),
+          settlePendingRequests: Effect.void,
+          finishPendingRequestSettlement: Effect.void,
+          rebindProviderThread: () => Effect.void,
+        },
+      });
+
+      const firstRewind = yield* rewinder.rewindThread().pipe(Effect.forkChild);
+      yield* Deferred.await(firstReplacementRequested);
+      const secondRewind = yield* rewinder.rewindThread().pipe(Effect.forkChild);
+      const send = yield* semaphore
+        .withPermit(Effect.sync(() => calls.push("send")))
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      NodeAssert.deepStrictEqual(calls, ["thread/read", "thread/start"]);
+      NodeAssert.equal(secondRewind.pollUnsafe(), undefined);
+      NodeAssert.equal(send.pollUnsafe(), undefined);
+
+      yield* Deferred.succeed(firstReplacementAllowed, undefined);
+      yield* Fiber.join(firstRewind);
+      yield* Fiber.join(secondRewind);
+      yield* Fiber.join(send);
+      NodeAssert.deepStrictEqual(calls, [
+        "thread/read",
+        "thread/start",
+        "thread/read",
+        "thread/start",
+        "send",
+      ]);
+    }),
+  );
 });
 
 describe("openCodexThread", () => {

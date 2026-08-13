@@ -196,6 +196,25 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
       Effect.succeed({ threadId, turns: [] }),
   );
 
+  const rewindThread = vi.fn(
+    (
+      threadId: ThreadId,
+      _lastTurnId?: TurnId,
+    ): Effect.Effect<
+      {
+        threadId: ThreadId;
+        turns: ReadonlyArray<{ id: TurnId; items: readonly [] }>;
+        resumeCursor: unknown;
+      },
+      ProviderAdapterError
+    > =>
+      Effect.succeed({
+        threadId,
+        turns: [{ id: asTurnId("retained-turn"), items: [] }],
+        resumeCursor: { threadId: `replacement-${String(threadId)}` },
+      }),
+  );
+
   const stopAll = vi.fn(
     (): Effect.Effect<void, ProviderAdapterError> =>
       Effect.sync(() => {
@@ -207,6 +226,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     provider,
     capabilities: {
       sessionModelSwitch: "in-session",
+      conversationRewind: provider === "codex" ? "fork" : "unsupported",
     },
     startSession,
     sendTurn,
@@ -218,6 +238,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     hasSession,
     readThread,
     rollbackThread,
+    rewindThread,
     stopAll,
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
@@ -253,6 +274,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     hasSession,
     readThread,
     rollbackThread,
+    rewindThread,
     stopAll,
   };
 }
@@ -937,6 +959,70 @@ routing.layer("ProviderServiceLive routing", (it) => {
         assert.equal(startPayload.threadId, session.threadId);
       }
       assert.equal(routing.codex.sendTurn.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect("persists the replacement resume cursor and uses it after restart", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-rewind");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+
+      routing.codex.rewindThread.mockClear();
+      const replacement = yield* provider.rewindConversation({
+        threadId,
+        lastTurnId: asTurnId("retained-turn"),
+      });
+      const replacementCursor = { threadId: `replacement-${String(threadId)}` };
+      assert.deepEqual(routing.codex.rewindThread.mock.calls, [
+        [threadId, asTurnId("retained-turn")],
+      ]);
+      assert.deepEqual(replacement.resumeCursor, replacementCursor);
+
+      const persisted = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.deepEqual(persisted?.resumeCursor, replacementCursor);
+
+      yield* provider.stopSession({ threadId });
+      routing.codex.startSession.mockClear();
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+      assert.deepEqual(
+        routing.codex.startSession.mock.calls[0]?.[0]?.resumeCursor,
+        replacementCursor,
+      );
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("rejects rewind for an unsupported adapter", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-rewind");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: ProviderInstanceId.make("cursor"),
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+
+      const error = yield* provider.rewindConversation({ threadId }).pipe(Effect.flip);
+      assert.instanceOf(error, ProviderValidationError);
+      assert.include(error.issue, "does not support conversation rewind");
+      assert.equal(routing.cursor.rewindThread.mock.calls.length, 0);
+      yield* provider.stopSession({ threadId });
     }),
   );
 

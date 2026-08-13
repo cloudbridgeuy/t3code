@@ -103,6 +103,14 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
       }),
   );
 
+  public readonly rewindThreadImpl = vi.fn(
+    (_lastTurnId?: TurnId): Promise<CodexThreadSnapshot> =>
+      Promise.resolve({
+        threadId: "provider-thread-replacement",
+        turns: [],
+      }),
+  );
+
   public readonly respondToRequestImpl = vi.fn(
     (_requestId: ApprovalRequestId, _decision: ProviderApprovalDecision): Promise<void> =>
       Promise.resolve(undefined),
@@ -139,6 +147,10 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
 
   rollbackThread(numTurns: number) {
     return Effect.promise(() => this.rollbackThreadImpl(numTurns));
+  }
+
+  rewindThread(lastTurnId?: TurnId) {
+    return Effect.promise(() => this.rewindThreadImpl(lastTurnId));
   }
 
   respondToRequest(requestId: ApprovalRequestId, decision: ProviderApprovalDecision) {
@@ -512,6 +524,24 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("advertises and delegates conversation rewind", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      NodeAssert.equal(adapter.capabilities.conversationRewind, "fork");
+      NodeAssert.ok(adapter.rewindThread);
+
+      const result = yield* adapter.rewindThread(asThreadId("thread-1"), asTurnId("retained-turn"));
+
+      NodeAssert.deepStrictEqual(runtime.rewindThreadImpl.mock.calls, [
+        [asTurnId("retained-turn")],
+      ]);
+      NodeAssert.equal(result.threadId, asThreadId("thread-1"));
+      NodeAssert.deepStrictEqual(result.resumeCursor, {
+        threadId: "provider-thread-replacement",
+      });
+    }),
+  );
+
   it.effect("maps completed agent message items to canonical item.completed events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

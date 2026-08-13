@@ -27,6 +27,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -59,6 +60,8 @@ const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "unknown thread",
   "does not exist",
 ];
+const CODEX_CHILD_INTERRUPT_TIMEOUT = "3 seconds" as const;
+const CODEX_CHILD_INTERRUPT_BATCH_TIMEOUT = "10 seconds" as const;
 
 export function hasConfiguredMcpServer(appServerArgs: ReadonlyArray<string> | undefined): boolean {
   return appServerArgs?.some((argument) => argument.includes("mcp_servers.")) === true;
@@ -91,7 +94,8 @@ export type CodexResumeCursor = typeof CodexResumeCursorSchema.Type;
 type CodexServiceTier = NonNullable<EffectCodexSchema.V2ThreadStartParams["serviceTier"]>;
 type CodexThreadItem =
   | EffectCodexSchema.V2ThreadReadResponse["thread"]["turns"][number]["items"][number]
-  | EffectCodexSchema.V2ThreadRollbackResponse["thread"]["turns"][number]["items"][number];
+  | EffectCodexSchema.V2ThreadRollbackResponse["thread"]["turns"][number]["items"][number]
+  | EffectCodexSchema.V2ThreadForkResponse["thread"]["turns"][number]["items"][number];
 
 export interface CodexSessionRuntimeOptions {
   readonly threadId: ThreadId;
@@ -138,6 +142,9 @@ export interface CodexSessionRuntimeShape {
   ) => Effect.Effect<ProviderTurnStartResult, CodexSessionRuntimeError>;
   readonly interruptTurn: (turnId?: TurnId) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly readThread: Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
+  readonly rewindThread: (
+    lastTurnId?: TurnId,
+  ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
   readonly rollbackThread: (
     numTurns: number,
   ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
@@ -158,6 +165,8 @@ export type CodexSessionRuntimeError =
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
   | CodexSessionRuntimeInvalidUserInputAnswersError
+  | CodexSessionRuntimeInvalidRetainedTurnError
+  | CodexSessionRuntimeActiveTurnMissingError
   | CodexSessionRuntimeThreadIdMissingError;
 
 export class CodexSessionRuntimePendingApprovalNotFoundError extends Schema.TaggedErrorClass<CodexSessionRuntimePendingApprovalNotFoundError>()(
@@ -204,6 +213,31 @@ export class CodexSessionRuntimeThreadIdMissingError extends Schema.TaggedErrorC
   }
 }
 
+export class CodexSessionRuntimeInvalidRetainedTurnError extends Schema.TaggedErrorClass<CodexSessionRuntimeInvalidRetainedTurnError>()(
+  "CodexSessionRuntimeInvalidRetainedTurnError",
+  {
+    turnId: Schema.String,
+    reason: Schema.Literals(["not-found", "not-completed"]),
+  },
+) {
+  override get message(): string {
+    return this.reason === "not-found"
+      ? `Codex thread does not contain retained turn '${this.turnId}'`
+      : `Codex retained turn '${this.turnId}' is not completed`;
+  }
+}
+
+export class CodexSessionRuntimeActiveTurnMissingError extends Schema.TaggedErrorClass<CodexSessionRuntimeActiveTurnMissingError>()(
+  "CodexSessionRuntimeActiveTurnMissingError",
+  {
+    threadId: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Codex thread '${this.threadId}' is active but has no active root turn`;
+  }
+}
+
 interface PendingApproval {
   readonly requestId: ApprovalRequestId;
   readonly jsonRpcId: string;
@@ -225,6 +259,87 @@ interface PendingUserInput {
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
   readonly answers: Deferred.Deferred<ProviderUserInputAnswers>;
+}
+
+export interface CodexPendingRequestStore<A> {
+  readonly register: (requestId: ApprovalRequestId, request: A) => Effect.Effect<boolean>;
+  readonly take: (requestId: ApprovalRequestId) => Effect.Effect<A | undefined>;
+  readonly drainForRewind: Effect.Effect<ReadonlyArray<A>>;
+  readonly finishRewind: Effect.Effect<void>;
+}
+
+export const makeCodexPendingRequestStore = Effect.fn("makeCodexPendingRequestStore")(<A>() =>
+  Effect.gen(function* () {
+    const stateRef = yield* Ref.make({
+      rewinding: false,
+      pending: new Map<ApprovalRequestId, A>(),
+    });
+    return {
+      register: (requestId, request) =>
+        Ref.modify(stateRef, (state) => {
+          if (state.rewinding) {
+            return [true, state] as const;
+          }
+          const pending = new Map(state.pending);
+          pending.set(requestId, request);
+          return [false, { ...state, pending }] as const;
+        }),
+      take: (requestId) =>
+        Ref.modify(stateRef, (state) => {
+          const request = state.pending.get(requestId);
+          if (!request) {
+            return [undefined, state] as const;
+          }
+          const pending = new Map(state.pending);
+          pending.delete(requestId);
+          return [request, { ...state, pending }] as const;
+        }),
+      drainForRewind: Ref.modify(stateRef, (state) => [
+        Array.from(state.pending.values()),
+        { rewinding: true, pending: new Map() },
+      ]),
+      finishRewind: Ref.update(stateRef, (state) => ({ ...state, rewinding: false })),
+    } satisfies CodexPendingRequestStore<A>;
+  }),
+);
+
+type CodexProviderEventInput = Omit<ProviderEvent, "id" | "provider" | "createdAt">;
+
+export function makeCodexApprovalDecisionEvent(input: {
+  readonly threadId: ThreadId;
+  readonly pending: Pick<PendingApproval, "requestId" | "requestKind" | "turnId" | "itemId">;
+  readonly decision: ProviderApprovalDecision;
+}): CodexProviderEventInput {
+  return {
+    kind: "notification",
+    threadId: input.threadId,
+    method: "item/requestApproval/decision",
+    requestId: input.pending.requestId,
+    requestKind: input.pending.requestKind,
+    ...(input.pending.turnId ? { turnId: input.pending.turnId } : {}),
+    ...(input.pending.itemId ? { itemId: input.pending.itemId } : {}),
+    payload: {
+      requestId: input.pending.requestId,
+      requestKind: input.pending.requestKind,
+      decision: input.decision,
+    },
+  };
+}
+
+export function makeCodexUserInputAnsweredEvent(input: {
+  readonly threadId: ThreadId;
+  readonly pending: Pick<PendingUserInput, "requestId" | "turnId" | "itemId">;
+  readonly answers: EffectCodexSchema.ToolRequestUserInputResponse["answers"];
+}): CodexProviderEventInput {
+  return {
+    kind: "notification",
+    threadId: input.threadId,
+    method: "item/tool/requestUserInput/answered",
+    requestId: input.pending.requestId,
+    ...(input.pending.turnId ? { turnId: input.pending.turnId } : {}),
+    ...(input.pending.itemId ? { itemId: input.pending.itemId } : {}),
+    payload: { answers: input.answers },
+  };
 }
 
 type CodexServerNotification = {
@@ -492,6 +607,315 @@ export const openCodexThread = (input: {
       ),
     );
 };
+
+export type CodexRewindPlan =
+  | { readonly _tag: "start" }
+  | { readonly _tag: "fork"; readonly lastTurnId: string }
+  | {
+      readonly _tag: "invalid";
+      readonly turnId: string;
+      readonly reason: "not-found" | "not-completed";
+    };
+
+export function resolveCodexRewindPlan(
+  turns: ReadonlyArray<{ readonly id: string; readonly status: string }>,
+  lastTurnId: TurnId | undefined,
+): CodexRewindPlan {
+  if (lastTurnId === undefined) {
+    return { _tag: "start" };
+  }
+  const retained = turns.find((turn) => turn.id === lastTurnId);
+  if (!retained) {
+    return { _tag: "invalid", turnId: lastTurnId, reason: "not-found" };
+  }
+  if (retained.status !== "completed") {
+    return { _tag: "invalid", turnId: lastTurnId, reason: "not-completed" };
+  }
+  return { _tag: "fork", lastTurnId };
+}
+
+export function resolveActiveCodexTurnId(
+  turns: ReadonlyArray<{ readonly id: string; readonly status: string }>,
+  sessionActiveTurnId: TurnId | undefined,
+): string | undefined {
+  if (sessionActiveTurnId !== undefined) {
+    return sessionActiveTurnId;
+  }
+  return turns.findLast((turn) => turn.status === "inProgress")?.id;
+}
+
+export interface CodexRewindWaitPlan {
+  readonly _tag: "ready" | "invalid";
+  readonly rootTurnId: string | undefined;
+  readonly waitForRootCompletion: boolean;
+  readonly waitForSourceIdle: boolean;
+}
+
+export function resolveCodexRewindWaitPlan(input: {
+  readonly turns: ReadonlyArray<{ readonly id: string; readonly status: string }>;
+  readonly sourceStatus: string;
+  readonly sessionActiveTurnId: TurnId | undefined;
+}): CodexRewindWaitPlan {
+  if (input.sourceStatus !== "active") {
+    return {
+      _tag: "ready",
+      rootTurnId: undefined,
+      waitForRootCompletion: false,
+      waitForSourceIdle: false,
+    };
+  }
+  const rootTurnId = resolveActiveCodexTurnId(input.turns, input.sessionActiveTurnId);
+  if (rootTurnId === undefined) {
+    return {
+      _tag: "invalid",
+      rootTurnId: undefined,
+      waitForRootCompletion: false,
+      waitForSourceIdle: false,
+    };
+  }
+  return {
+    _tag: "ready",
+    rootTurnId,
+    waitForRootCompletion: true,
+    waitForSourceIdle: true,
+  };
+}
+
+type CodexThreadRewindMethod = "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start";
+
+interface CodexThreadRewindClient {
+  readonly request: <M extends CodexThreadRewindMethod>(
+    method: M,
+    payload: CodexRpc.ClientRequestParamsByMethod[M],
+  ) => Effect.Effect<CodexRpc.ClientRequestResponsesByMethod[M], CodexErrors.CodexAppServerError>;
+}
+
+interface CodexThreadRewindState {
+  readonly getSession: Effect.Effect<ProviderSession>;
+  readonly getLiveChildTurns: Effect.Effect<ReadonlyMap<string, string>>;
+  readonly settlePendingRequests: Effect.Effect<void, CodexErrors.CodexAppServerError>;
+  readonly finishPendingRequestSettlement: Effect.Effect<void>;
+  readonly threadMutationSemaphore: Semaphore.Semaphore;
+  readonly rebindProviderThread: (input: {
+    readonly threadId: string;
+    readonly cwd: string;
+    readonly model: string;
+  }) => Effect.Effect<void>;
+}
+
+interface CodexRewindSettlement {
+  readonly sourceThreadId: string;
+  readonly rootTurnId: string | undefined;
+  readonly rootCompleted: Deferred.Deferred<void> | undefined;
+  readonly sourceIdle: Deferred.Deferred<void> | undefined;
+}
+
+function makeCodexRewindSettlement(
+  sourceThreadId: string,
+  waitPlan: CodexRewindWaitPlan,
+): Effect.Effect<CodexRewindSettlement> {
+  return Effect.gen(function* () {
+    const rootCompleted = waitPlan.waitForRootCompletion ? yield* Deferred.make<void>() : undefined;
+    const sourceIdle = waitPlan.waitForSourceIdle ? yield* Deferred.make<void>() : undefined;
+    return {
+      sourceThreadId,
+      rootTurnId: waitPlan.rootTurnId,
+      rootCompleted,
+      sourceIdle,
+    } satisfies CodexRewindSettlement;
+  });
+}
+
+function awaitCodexRewindSettlement(settlement: CodexRewindSettlement): Effect.Effect<void> {
+  const deferreds = [settlement.rootCompleted, settlement.sourceIdle].filter(
+    (deferred): deferred is Deferred.Deferred<void> => deferred !== undefined,
+  );
+  return Effect.forEach(deferreds, Deferred.await, {
+    concurrency: "unbounded",
+    discard: true,
+  });
+}
+
+function interruptCodexLiveTurns(
+  client: CodexThreadRewindClient,
+  liveTurns: ReadonlyMap<string, string>,
+): Effect.Effect<void> {
+  return Effect.forEach(
+    Array.from(liveTurns.entries()),
+    ([childThreadId, childTurnId]) =>
+      client
+        .request("turn/interrupt", {
+          threadId: childThreadId,
+          turnId: childTurnId,
+        })
+        .pipe(Effect.timeoutOption(CODEX_CHILD_INTERRUPT_TIMEOUT), Effect.ignore),
+    { concurrency: 8, discard: true },
+  ).pipe(Effect.timeoutOption(CODEX_CHILD_INTERRUPT_BATCH_TIMEOUT), Effect.ignore);
+}
+
+function startCodexReplacementThread(input: {
+  readonly client: CodexThreadRewindClient;
+  readonly sourceThreadId: string;
+  readonly plan: Exclude<CodexRewindPlan, { readonly _tag: "invalid" }>;
+  readonly cwd: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly model: string | undefined;
+  readonly serviceTier: CodexServiceTier | undefined;
+}): Effect.Effect<
+  | CodexRpc.ClientRequestResponsesByMethod["thread/fork"]
+  | CodexRpc.ClientRequestResponsesByMethod["thread/start"],
+  CodexErrors.CodexAppServerError
+> {
+  if (input.plan._tag === "fork") {
+    return input.client.request("thread/fork", {
+      threadId: input.sourceThreadId,
+      lastTurnId: input.plan.lastTurnId,
+    });
+  }
+
+  return input.client.request(
+    "thread/start",
+    buildThreadStartParams({
+      cwd: input.cwd,
+      runtimeMode: input.runtimeMode,
+      model: input.model,
+      serviceTier: input.serviceTier,
+    }),
+  );
+}
+
+export interface CodexThreadRewinder {
+  readonly rewindThread: (
+    lastTurnId?: TurnId,
+  ) => Effect.Effect<
+    CodexThreadSnapshot,
+    | CodexErrors.CodexAppServerError
+    | CodexSessionRuntimeInvalidRetainedTurnError
+    | CodexSessionRuntimeActiveTurnMissingError
+    | CodexSessionRuntimeThreadIdMissingError
+  >;
+  readonly observeTurnCompleted: (input: {
+    readonly threadId: string;
+    readonly turnId: string;
+  }) => Effect.Effect<void>;
+  readonly observeThreadStatusChanged: (input: {
+    readonly threadId: string;
+    readonly status: { readonly type: string };
+  }) => Effect.Effect<void>;
+}
+
+export const makeCodexThreadRewinder = Effect.fn("makeCodexThreadRewinder")(function* (input: {
+  readonly client: CodexThreadRewindClient;
+  readonly state: CodexThreadRewindState;
+  readonly runtimeMode: RuntimeMode;
+  readonly cwd: string;
+  readonly model: string | undefined;
+  readonly serviceTier: CodexServiceTier | undefined;
+}) {
+  const settlementRef = yield* Ref.make<CodexRewindSettlement | undefined>(undefined);
+
+  const observeTurnCompleted: CodexThreadRewinder["observeTurnCompleted"] = (notification) =>
+    Ref.get(settlementRef).pipe(
+      Effect.flatMap((settlement) =>
+        settlement?.rootCompleted !== undefined &&
+        settlement.sourceThreadId === notification.threadId &&
+        settlement.rootTurnId === notification.turnId
+          ? Deferred.succeed(settlement.rootCompleted, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      ),
+    );
+
+  const observeThreadStatusChanged: CodexThreadRewinder["observeThreadStatusChanged"] = (
+    notification,
+  ) =>
+    Ref.get(settlementRef).pipe(
+      Effect.flatMap((settlement) =>
+        settlement?.sourceIdle !== undefined &&
+        settlement.sourceThreadId === notification.threadId &&
+        notification.status.type === "idle"
+          ? Deferred.succeed(settlement.sourceIdle, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      ),
+    );
+
+  const rewindThread: CodexThreadRewinder["rewindThread"] = Effect.fn(
+    "CodexSessionRuntime.rewindThread",
+  )(function* (lastTurnId) {
+    const session = yield* input.state.getSession;
+    const sourceThreadId = currentProviderThreadId(session);
+    if (sourceThreadId === undefined) {
+      return yield* new CodexSessionRuntimeThreadIdMissingError({ threadId: session.threadId });
+    }
+    const source = yield* input.client.request("thread/read", {
+      threadId: sourceThreadId,
+      includeTurns: true,
+    });
+    const plan = resolveCodexRewindPlan(source.thread.turns, lastTurnId);
+    if (plan._tag === "invalid") {
+      return yield* new CodexSessionRuntimeInvalidRetainedTurnError({
+        turnId: plan.turnId,
+        reason: plan.reason,
+      });
+    }
+
+    const waitPlan = resolveCodexRewindWaitPlan({
+      turns: source.thread.turns,
+      sourceStatus: source.thread.status.type,
+      sessionActiveTurnId: session.activeTurnId,
+    });
+    if (waitPlan._tag === "invalid") {
+      return yield* new CodexSessionRuntimeActiveTurnMissingError({ threadId: sourceThreadId });
+    }
+    const settlement = yield* makeCodexRewindSettlement(sourceThreadId, waitPlan);
+    yield* Ref.set(settlementRef, settlement);
+
+    return yield* Effect.gen(function* () {
+      yield* input.state.settlePendingRequests;
+      yield* input.state.getLiveChildTurns.pipe(
+        Effect.flatMap((liveChildTurns) => interruptCodexLiveTurns(input.client, liveChildTurns)),
+      );
+
+      if (waitPlan.rootTurnId !== undefined) {
+        yield* input.client.request("turn/interrupt", {
+          threadId: sourceThreadId,
+          turnId: waitPlan.rootTurnId,
+        });
+      }
+
+      yield* awaitCodexRewindSettlement(settlement);
+
+      const replacement = yield* startCodexReplacementThread({
+        client: input.client,
+        sourceThreadId,
+        plan,
+        cwd: input.cwd,
+        runtimeMode: input.runtimeMode,
+        model: input.model,
+        serviceTier: input.serviceTier,
+      });
+
+      yield* input.state.rebindProviderThread({
+        threadId: replacement.thread.id,
+        cwd: replacement.cwd,
+        model: replacement.model,
+      });
+      return parseThreadSnapshot(replacement);
+    }).pipe(
+      Effect.ensuring(
+        Effect.all(
+          [Ref.set(settlementRef, undefined), input.state.finishPendingRequestSettlement],
+          { discard: true },
+        ),
+      ),
+    );
+  }, input.state.threadMutationSemaphore.withPermit);
+
+  return {
+    rewindThread,
+    observeTurnCompleted,
+    observeThreadStatusChanged,
+  } satisfies CodexThreadRewinder;
+});
 
 function readNotificationThreadId(notification: CodexServerNotification): string | undefined {
   switch (notification.method) {
@@ -792,7 +1216,7 @@ function toCodexUserInputAnswer(
   return Effect.fail(new CodexSessionRuntimeInvalidUserInputAnswersError({ questionId }));
 }
 
-function toCodexUserInputAnswers(
+export function toCodexUserInputAnswers(
   answers: ProviderUserInputAnswers,
 ): Effect.Effect<
   EffectCodexSchema.ToolRequestUserInputResponse["answers"],
@@ -827,7 +1251,11 @@ function updateSession(
 }
 
 function parseThreadSnapshot(
-  response: EffectCodexSchema.V2ThreadReadResponse | EffectCodexSchema.V2ThreadRollbackResponse,
+  response:
+    | EffectCodexSchema.V2ThreadReadResponse
+    | EffectCodexSchema.V2ThreadRollbackResponse
+    | EffectCodexSchema.V2ThreadForkResponse
+    | EffectCodexSchema.V2ThreadStartResponse,
 ): CodexThreadSnapshot {
   return {
     threadId: response.thread.id,
@@ -850,14 +1278,16 @@ export const makeCodexSessionRuntime = (
     const runtimeScope = yield* Scope.Scope;
     const crypto = yield* Crypto.Crypto;
     const events = yield* Queue.unbounded<ProviderEvent>();
-    const pendingApprovalsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingApproval>());
+    const pendingApprovals = yield* makeCodexPendingRequestStore<PendingApproval>();
     const approvalCorrelationsRef = yield* Ref.make(new Map<string, ApprovalCorrelation>());
-    const pendingUserInputsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingUserInput>());
+    const pendingUserInputs = yield* makeCodexPendingRequestStore<PendingUserInput>();
     const collabReceiverTurnsRef = yield* Ref.make(new Map<string, TurnId>());
     const collabChildAgentsRef = yield* Ref.make(new Map<string, CollabChildAgentState>());
     /** Child provider-thread id → its currently running provider turn id. */
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
     const closedRef = yield* Ref.make(false);
+    const threadMutationSemaphore = yield* Semaphore.make(1);
+    const pendingRequestSemaphore = yield* Semaphore.make(1);
 
     // `~` is not shell-expanded when env vars are set via
     // `child_process.spawn`; `expandHomePath` lets a configured
@@ -950,28 +1380,104 @@ export const makeCodexSessionRuntime = (
       });
 
     const settlePendingApprovals = (decision: ProviderApprovalDecision) =>
-      Ref.get(pendingApprovalsRef).pipe(
-        Effect.flatMap((pendingApprovals) =>
-          Effect.forEach(
-            Array.from(pendingApprovals.values()),
-            (pendingApproval) =>
-              Deferred.succeed(pendingApproval.decision, decision).pipe(Effect.ignore),
-            { discard: true },
-          ),
+      pendingApprovals.drainForRewind.pipe(
+        Effect.flatMap((requests) =>
+          Effect.forEach(requests, (request) => Deferred.succeed(request.decision, decision), {
+            discard: true,
+          }),
         ),
+        Effect.ensuring(pendingApprovals.finishRewind),
       );
 
     const settlePendingUserInputs = (answers: ProviderUserInputAnswers) =>
-      Ref.get(pendingUserInputsRef).pipe(
-        Effect.flatMap((pendingUserInputs) =>
-          Effect.forEach(
-            Array.from(pendingUserInputs.values()),
-            (pendingUserInput) =>
-              Deferred.succeed(pendingUserInput.answers, answers).pipe(Effect.ignore),
-            { discard: true },
+      pendingUserInputs.drainForRewind.pipe(
+        Effect.flatMap((requests) =>
+          Effect.forEach(requests, (request) => Deferred.succeed(request.answers, answers), {
+            discard: true,
+          }),
+        ),
+        Effect.ensuring(pendingUserInputs.finishRewind),
+      );
+
+    const takePendingApproval = pendingApprovals.take;
+    const takePendingUserInput = pendingUserInputs.take;
+
+    const resolvePendingApproval = (pending: PendingApproval, decision: ProviderApprovalDecision) =>
+      Effect.gen(function* () {
+        yield* Deferred.succeed(pending.decision, decision);
+        yield* emitEvent(
+          makeCodexApprovalDecisionEvent({ threadId: options.threadId, pending, decision }),
+        );
+      });
+
+    const resolvePendingUserInput = (
+      pending: PendingUserInput,
+      answers: ProviderUserInputAnswers,
+      codexAnswers: EffectCodexSchema.ToolRequestUserInputResponse["answers"],
+    ) =>
+      Effect.gen(function* () {
+        yield* Deferred.succeed(pending.answers, answers);
+        yield* emitEvent(
+          makeCodexUserInputAnsweredEvent({
+            threadId: options.threadId,
+            pending,
+            answers: codexAnswers,
+          }),
+        );
+      });
+
+    const settlePendingRequestsForRewind = Effect.all(
+      [
+        pendingApprovals.drainForRewind.pipe(
+          Effect.flatMap((requests) =>
+            Effect.forEach(requests, (request) => resolvePendingApproval(request, "cancel"), {
+              discard: true,
+            }),
           ),
         ),
-      );
+        pendingUserInputs.drainForRewind.pipe(
+          Effect.flatMap((requests) =>
+            Effect.forEach(requests, (request) => resolvePendingUserInput(request, {}, {}), {
+              discard: true,
+            }),
+          ),
+        ),
+      ],
+      { discard: true },
+    ).pipe(pendingRequestSemaphore.withPermit);
+
+    const threadRewinder = yield* makeCodexThreadRewinder({
+      client,
+      runtimeMode: options.runtimeMode,
+      cwd: options.cwd,
+      model: options.model,
+      serviceTier: options.serviceTier,
+      state: {
+        getSession: Ref.get(sessionRef),
+        getLiveChildTurns: Ref.get(collabChildLiveTurnsRef),
+        settlePendingRequests: settlePendingRequestsForRewind,
+        finishPendingRequestSettlement: Effect.all(
+          [pendingApprovals.finishRewind, pendingUserInputs.finishRewind],
+          { discard: true },
+        ),
+        threadMutationSemaphore,
+        rebindProviderThread: (replacement) =>
+          Effect.gen(function* () {
+            yield* Ref.set(approvalCorrelationsRef, new Map());
+            yield* Ref.set(collabReceiverTurnsRef, new Map());
+            yield* Ref.set(collabChildAgentsRef, new Map());
+            yield* Ref.set(collabChildLiveTurnsRef, new Map());
+            yield* Queue.takeAll(serverNotifications);
+            yield* updateSession(sessionRef, {
+              status: "ready",
+              activeTurnId: undefined,
+              cwd: replacement.cwd,
+              model: replacement.model,
+              resumeCursor: { threadId: replacement.threadId },
+            });
+          }),
+      },
+    });
 
     /**
      * Registers v2 collab children and re-emits their notifications as
@@ -1407,13 +1913,26 @@ export const makeCodexSessionRuntime = (
             payload.turn.status === "failed" && "error" in payload.turn && payload.turn.error
               ? payload.turn.error.message
               : undefined;
-          return updateSession(sessionRef, {
-            status: payload.turn.status === "failed" ? "error" : "ready",
-            activeTurnId: undefined,
-            ...(lastError ? { lastError } : {}),
-          });
+          return threadRewinder
+            .observeTurnCompleted({
+              threadId: payload.threadId,
+              turnId: payload.turn.id,
+            })
+            .pipe(
+              Effect.andThen(
+                updateSession(sessionRef, {
+                  status: payload.turn.status === "failed" ? "error" : "ready",
+                  activeTurnId: undefined,
+                  ...(lastError ? { lastError } : {}),
+                }),
+              ),
+            );
         }),
       ),
+    );
+
+    yield* client.handleServerNotification("thread/status/changed", (payload) =>
+      threadRewinder.observeThreadStatusChanged(payload),
     );
 
     yield* client.handleServerNotification("error", (payload) =>
@@ -1435,53 +1954,51 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/commandExecution/requestApproval", (payload) =>
       Effect.gen(function* () {
-        const requestId = ApprovalRequestId.make(yield* randomUUIDv4("command-approval-request"));
-        const turnId = TurnId.make(payload.turnId);
-        const itemId = ProviderItemId.make(payload.itemId);
-        const decision = yield* Deferred.make<ProviderApprovalDecision>();
-
-        yield* Ref.update(pendingApprovalsRef, (current) => {
-          const next = new Map(current);
-          next.set(requestId, {
-            requestId,
-            jsonRpcId: payload.approvalId ?? payload.itemId,
-            requestKind: "command",
-            turnId,
-            itemId,
-            decision,
-          });
-          return next;
-        });
-        yield* Ref.update(approvalCorrelationsRef, (current) => {
-          const next = new Map(current);
-          next.set(payload.approvalId ?? payload.itemId, {
-            requestId,
-            requestKind: "command",
-            turnId,
-            itemId,
-          });
-          return next;
-        });
-
-        yield* emitEvent({
-          kind: "request",
-          threadId: options.threadId,
-          method: "item/commandExecution/requestApproval",
-          requestId,
-          requestKind: "command",
-          ...(turnId ? { turnId } : {}),
-          ...(itemId ? { itemId } : {}),
-          payload,
-        });
-
-        const resolved = yield* Deferred.await(decision).pipe(
-          Effect.ensuring(
-            Ref.update(pendingApprovalsRef, (current) => {
+        const pending = yield* pendingRequestSemaphore.withPermit(
+          Effect.gen(function* () {
+            const requestId = ApprovalRequestId.make(
+              yield* randomUUIDv4("command-approval-request"),
+            );
+            const turnId = TurnId.make(payload.turnId);
+            const itemId = ProviderItemId.make(payload.itemId);
+            const decision = yield* Deferred.make<ProviderApprovalDecision>();
+            const pending = {
+              requestId,
+              jsonRpcId: payload.approvalId ?? payload.itemId,
+              requestKind: "command",
+              turnId,
+              itemId,
+              decision,
+            } satisfies PendingApproval;
+            const settleImmediately = yield* pendingApprovals.register(requestId, pending);
+            yield* Ref.update(approvalCorrelationsRef, (current) => {
               const next = new Map(current);
-              next.delete(requestId);
+              next.set(payload.approvalId ?? payload.itemId, {
+                requestId,
+                requestKind: "command",
+                turnId,
+                itemId,
+              });
               return next;
-            }),
-          ),
+            });
+            yield* emitEvent({
+              kind: "request",
+              threadId: options.threadId,
+              method: "item/commandExecution/requestApproval",
+              requestId,
+              requestKind: "command",
+              ...(turnId ? { turnId } : {}),
+              ...(itemId ? { itemId } : {}),
+              payload,
+            });
+            if (settleImmediately) {
+              yield* resolvePendingApproval(pending, "cancel");
+            }
+            return pending;
+          }),
+        );
+        const resolved = yield* Deferred.await(pending.decision).pipe(
+          Effect.ensuring(pendingApprovals.take(pending.requestId)),
         );
         return {
           decision: resolved,
@@ -1491,55 +2008,51 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/fileChange/requestApproval", (payload) =>
       Effect.gen(function* () {
-        const requestId = ApprovalRequestId.make(
-          yield* randomUUIDv4("file-change-approval-request"),
-        );
-        const turnId = TurnId.make(payload.turnId);
-        const itemId = ProviderItemId.make(payload.itemId);
-        const decision = yield* Deferred.make<ProviderApprovalDecision>();
-
-        yield* Ref.update(pendingApprovalsRef, (current) => {
-          const next = new Map(current);
-          next.set(requestId, {
-            requestId,
-            jsonRpcId: payload.itemId,
-            requestKind: "file-change",
-            turnId,
-            itemId,
-            decision,
-          });
-          return next;
-        });
-        yield* Ref.update(approvalCorrelationsRef, (current) => {
-          const next = new Map(current);
-          next.set(payload.itemId, {
-            requestId,
-            requestKind: "file-change",
-            turnId,
-            itemId,
-          });
-          return next;
-        });
-
-        yield* emitEvent({
-          kind: "request",
-          threadId: options.threadId,
-          method: "item/fileChange/requestApproval",
-          requestId,
-          requestKind: "file-change",
-          ...(turnId ? { turnId } : {}),
-          ...(itemId ? { itemId } : {}),
-          payload,
-        });
-
-        const resolved = yield* Deferred.await(decision).pipe(
-          Effect.ensuring(
-            Ref.update(pendingApprovalsRef, (current) => {
+        const pending = yield* pendingRequestSemaphore.withPermit(
+          Effect.gen(function* () {
+            const requestId = ApprovalRequestId.make(
+              yield* randomUUIDv4("file-change-approval-request"),
+            );
+            const turnId = TurnId.make(payload.turnId);
+            const itemId = ProviderItemId.make(payload.itemId);
+            const decision = yield* Deferred.make<ProviderApprovalDecision>();
+            const pending = {
+              requestId,
+              jsonRpcId: payload.itemId,
+              requestKind: "file-change",
+              turnId,
+              itemId,
+              decision,
+            } satisfies PendingApproval;
+            const settleImmediately = yield* pendingApprovals.register(requestId, pending);
+            yield* Ref.update(approvalCorrelationsRef, (current) => {
               const next = new Map(current);
-              next.delete(requestId);
+              next.set(payload.itemId, {
+                requestId,
+                requestKind: "file-change",
+                turnId,
+                itemId,
+              });
               return next;
-            }),
-          ),
+            });
+            yield* emitEvent({
+              kind: "request",
+              threadId: options.threadId,
+              method: "item/fileChange/requestApproval",
+              requestId,
+              requestKind: "file-change",
+              ...(turnId ? { turnId } : {}),
+              ...(itemId ? { itemId } : {}),
+              payload,
+            });
+            if (settleImmediately) {
+              yield* resolvePendingApproval(pending, "cancel");
+            }
+            return pending;
+          }),
+        );
+        const resolved = yield* Deferred.await(pending.decision).pipe(
+          Effect.ensuring(pendingApprovals.take(pending.requestId)),
         );
         return {
           decision: resolved,
@@ -1549,42 +2062,32 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/tool/requestUserInput", (payload) =>
       Effect.gen(function* () {
-        const requestId = ApprovalRequestId.make(yield* randomUUIDv4("user-input-request"));
-        const turnId = TurnId.make(payload.turnId);
-        const itemId = ProviderItemId.make(payload.itemId);
-        const answers = yield* Deferred.make<ProviderUserInputAnswers>();
-
-        yield* Ref.update(pendingUserInputsRef, (current) => {
-          const next = new Map(current);
-          next.set(requestId, {
-            requestId,
-            turnId,
-            itemId,
-            answers,
-          });
-          return next;
-        });
-
-        yield* emitEvent({
-          kind: "request",
-          threadId: options.threadId,
-          method: "item/tool/requestUserInput",
-          requestId,
-          ...(turnId ? { turnId } : {}),
-          ...(itemId ? { itemId } : {}),
-          payload,
-        });
-
-        const resolvedAnswers = yield* Deferred.await(answers).pipe(
-          Effect.ensuring(
-            Ref.update(pendingUserInputsRef, (current) => {
-              const next = new Map(current);
-              next.delete(requestId);
-              return next;
-            }),
-          ),
+        const pending = yield* pendingRequestSemaphore.withPermit(
+          Effect.gen(function* () {
+            const requestId = ApprovalRequestId.make(yield* randomUUIDv4("user-input-request"));
+            const turnId = TurnId.make(payload.turnId);
+            const itemId = ProviderItemId.make(payload.itemId);
+            const answers = yield* Deferred.make<ProviderUserInputAnswers>();
+            const pending = { requestId, turnId, itemId, answers } satisfies PendingUserInput;
+            const settleImmediately = yield* pendingUserInputs.register(requestId, pending);
+            yield* emitEvent({
+              kind: "request",
+              threadId: options.threadId,
+              method: "item/tool/requestUserInput",
+              requestId,
+              ...(turnId ? { turnId } : {}),
+              ...(itemId ? { itemId } : {}),
+              payload,
+            });
+            if (settleImmediately) {
+              yield* resolvePendingUserInput(pending, {}, {});
+            }
+            return pending;
+          }),
         );
-
+        const resolvedAnswers = yield* Deferred.await(pending.answers).pipe(
+          Effect.ensuring(pendingUserInputs.take(pending.requestId)),
+        );
         return {
           answers: yield* toCodexUserInputAnswers(resolvedAnswers).pipe(
             Effect.mapError((error) =>
@@ -1747,91 +2250,86 @@ export const makeCodexSessionRuntime = (
       start,
       getSession: Ref.get(sessionRef),
       sendTurn: (input) =>
-        Effect.gen(function* () {
-          const providerThreadId = yield* readProviderThreadId;
-          if (hasConfiguredMcpServer(options.appServerArgs)) {
-            yield* client.request("config/mcpServer/reload", undefined).pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("Failed to refresh Codex MCP tool catalog before turn.", {
-                  cause,
-                }),
+        threadMutationSemaphore.withPermit(
+          Effect.gen(function* () {
+            const providerThreadId = yield* readProviderThreadId;
+            if (hasConfiguredMcpServer(options.appServerArgs)) {
+              yield* client.request("config/mcpServer/reload", undefined).pipe(
+                Effect.catch((cause) =>
+                  Effect.logWarning("Failed to refresh Codex MCP tool catalog before turn.", {
+                    cause,
+                  }),
+                ),
+              );
+            }
+            const normalizedModel = normalizeCodexModelSlug(
+              input.model ?? (yield* Ref.get(sessionRef)).model,
+            );
+            const params = yield* buildTurnStartParams({
+              threadId: providerThreadId,
+              runtimeMode: options.runtimeMode,
+              ...(input.input ? { prompt: input.input } : {}),
+              ...(input.attachments ? { attachments: input.attachments } : {}),
+              ...(normalizedModel ? { model: normalizedModel } : {}),
+              ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
+              ...(input.effort ? { effort: input.effort } : {}),
+              ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
+            });
+            const rawResponse = yield* client.raw.request("turn/start", params);
+            const response = yield* decodeV2TurnStartResponse(rawResponse).pipe(
+              Effect.mapError((error) =>
+                CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
+                  "decode-response-payload",
+                  error,
+                  { method: "turn/start" },
+                ),
               ),
             );
-          }
-          const normalizedModel = normalizeCodexModelSlug(
-            input.model ?? (yield* Ref.get(sessionRef)).model,
-          );
-          const params = yield* buildTurnStartParams({
-            threadId: providerThreadId,
-            runtimeMode: options.runtimeMode,
-            ...(input.input ? { prompt: input.input } : {}),
-            ...(input.attachments ? { attachments: input.attachments } : {}),
-            ...(normalizedModel ? { model: normalizedModel } : {}),
-            ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
-            ...(input.effort ? { effort: input.effort } : {}),
-            ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
-          });
-          const rawResponse = yield* client.raw.request("turn/start", params);
-          const response = yield* decodeV2TurnStartResponse(rawResponse).pipe(
-            Effect.mapError((error) =>
-              CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
-                "decode-response-payload",
-                error,
-                { method: "turn/start" },
-              ),
-            ),
-          );
-          const turnId = TurnId.make(response.turn.id);
-          yield* updateSession(sessionRef, (session) => ({
-            status: "running",
-            // Codex accepts follow-ups while the current turn is still
-            // running. The response contains the queued turn id, but
-            // turn/interrupt only accepts the id that is active now.
-            activeTurnId: session.activeTurnId ?? turnId,
-            ...(normalizedModel ? { model: normalizedModel } : {}),
-          }));
-          const resumedProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
-          return {
-            threadId: options.threadId,
-            turnId,
-            ...(resumedProviderThreadId
-              ? { resumeCursor: { threadId: resumedProviderThreadId } }
-              : {}),
-          } satisfies ProviderTurnStartResult;
-        }),
+            const turnId = TurnId.make(response.turn.id);
+            yield* updateSession(sessionRef, (session) => ({
+              status: "running",
+              // Codex accepts follow-ups while the current turn is still
+              // running. The response contains the queued turn id, but
+              // turn/interrupt only accepts the id that is active now.
+              activeTurnId: session.activeTurnId ?? turnId,
+              ...(normalizedModel ? { model: normalizedModel } : {}),
+            }));
+            const resumedProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+            return {
+              threadId: options.threadId,
+              turnId,
+              ...(resumedProviderThreadId
+                ? { resumeCursor: { threadId: resumedProviderThreadId } }
+                : {}),
+            } satisfies ProviderTurnStartResult;
+          }),
+        ),
       interruptTurn: (turnId) =>
-        Effect.gen(function* () {
-          const providerThreadId = yield* readProviderThreadId;
-          const session = yield* Ref.get(sessionRef);
-          // Stop-everything: children are full threads with their own turns;
-          // interrupting only the parent leaves the fleet running. Interrupt
-          // each live child turn first, best-effort per child, BOUNDED: the
-          // transport awaits an unbounded Deferred per request, so a wedged
-          // child would otherwise block the parent interrupt forever —
-          // exactly during the runaway fleet where Stop matters most
-          // (review finding). Per-child and overall deadlines guarantee the
-          // parent interrupt below always runs.
-          const liveChildTurns = yield* Ref.get(collabChildLiveTurnsRef);
-          yield* Effect.forEach(
-            Array.from(liveChildTurns.entries()),
-            ([childThreadId, childTurnId]) =>
-              client
-                .request("turn/interrupt", {
-                  threadId: childThreadId,
-                  turnId: childTurnId,
-                })
-                .pipe(Effect.timeoutOption("3 seconds"), Effect.ignore),
-            { concurrency: 8, discard: true },
-          ).pipe(Effect.timeoutOption("10 seconds"), Effect.ignore);
-          const effectiveTurnId = turnId ?? session.activeTurnId;
-          if (!effectiveTurnId) {
-            return;
-          }
-          yield* client.request("turn/interrupt", {
-            threadId: providerThreadId,
-            turnId: effectiveTurnId,
-          });
-        }),
+        threadMutationSemaphore.withPermit(
+          Effect.gen(function* () {
+            const providerThreadId = yield* readProviderThreadId;
+            const session = yield* Ref.get(sessionRef);
+            // Stop-everything: children are full threads with their own turns;
+            // interrupting only the parent leaves the fleet running. Interrupt
+            // each live child turn first, best-effort per child, BOUNDED: the
+            // transport awaits an unbounded Deferred per request, so a wedged
+            // child would otherwise block the parent interrupt forever —
+            // exactly during the runaway fleet where Stop matters most
+            // (review finding). Per-child and overall deadlines guarantee the
+            // parent interrupt below always runs.
+            yield* Ref.get(collabChildLiveTurnsRef).pipe(
+              Effect.flatMap((liveChildTurns) => interruptCodexLiveTurns(client, liveChildTurns)),
+            );
+            const effectiveTurnId = turnId ?? session.activeTurnId;
+            if (!effectiveTurnId) {
+              return;
+            }
+            yield* client.request("turn/interrupt", {
+              threadId: providerThreadId,
+              turnId: effectiveTurnId,
+            });
+          }),
+        ),
       readThread: Effect.gen(function* () {
         const providerThreadId = yield* readProviderThreadId;
         const response = yield* client.request("thread/read", {
@@ -1840,74 +2338,42 @@ export const makeCodexSessionRuntime = (
         });
         return parseThreadSnapshot(response);
       }),
+      rewindThread: threadRewinder.rewindThread,
       rollbackThread: (numTurns) =>
-        Effect.gen(function* () {
-          const providerThreadId = yield* readProviderThreadId;
-          const response = yield* client.request("thread/rollback", {
-            threadId: providerThreadId,
-            numTurns,
-          });
-          yield* updateSession(sessionRef, {
-            status: "ready",
-            activeTurnId: undefined,
-          });
-          return parseThreadSnapshot(response);
-        }),
+        threadMutationSemaphore.withPermit(
+          Effect.gen(function* () {
+            const providerThreadId = yield* readProviderThreadId;
+            const response = yield* client.request("thread/rollback", {
+              threadId: providerThreadId,
+              numTurns,
+            });
+            yield* updateSession(sessionRef, {
+              status: "ready",
+              activeTurnId: undefined,
+            });
+            return parseThreadSnapshot(response);
+          }),
+        ),
       respondToRequest: (requestId, decision) =>
         Effect.gen(function* () {
-          const pending = (yield* Ref.get(pendingApprovalsRef)).get(requestId);
+          const pending = yield* takePendingApproval(requestId);
           if (!pending) {
             return yield* new CodexSessionRuntimePendingApprovalNotFoundError({
               requestId,
             });
           }
-          yield* Ref.update(pendingApprovalsRef, (current) => {
-            const next = new Map(current);
-            next.delete(requestId);
-            return next;
-          });
-          yield* Deferred.succeed(pending.decision, decision);
-          yield* emitEvent({
-            kind: "notification",
-            threadId: options.threadId,
-            method: "item/requestApproval/decision",
-            requestId: pending.requestId,
-            requestKind: pending.requestKind,
-            ...(pending.turnId ? { turnId: pending.turnId } : {}),
-            ...(pending.itemId ? { itemId: pending.itemId } : {}),
-            payload: {
-              requestId: pending.requestId,
-              requestKind: pending.requestKind,
-              decision,
-            },
-          });
+          yield* resolvePendingApproval(pending, decision);
         }),
       respondToUserInput: (requestId, answers) =>
         Effect.gen(function* () {
-          const pending = (yield* Ref.get(pendingUserInputsRef)).get(requestId);
+          const codexAnswers = yield* toCodexUserInputAnswers(answers);
+          const pending = yield* takePendingUserInput(requestId);
           if (!pending) {
             return yield* new CodexSessionRuntimePendingUserInputNotFoundError({
               requestId,
             });
           }
-          const codexAnswers = yield* toCodexUserInputAnswers(answers);
-          yield* Ref.update(pendingUserInputsRef, (current) => {
-            const next = new Map(current);
-            next.delete(requestId);
-            return next;
-          });
-          yield* Deferred.succeed(pending.answers, answers);
-          yield* emitEvent({
-            kind: "notification",
-            threadId: options.threadId,
-            method: "item/tool/requestUserInput/answered",
-            requestId: pending.requestId,
-            ...(pending.turnId ? { turnId: pending.turnId } : {}),
-            ...(pending.itemId ? { itemId: pending.itemId } : {}),
-            payload: {
-              answers: codexAnswers,
-            },
-          });
+          yield* resolvePendingUserInput(pending, answers, codexAnswers);
         }),
       events: Stream.fromQueue(events),
       close,

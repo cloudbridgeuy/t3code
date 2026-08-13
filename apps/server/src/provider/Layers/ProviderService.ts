@@ -13,6 +13,7 @@ import {
   ModelSelection,
   NonNegativeInt,
   ThreadId,
+  TurnId,
   ProviderInterruptTurnInput,
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
@@ -74,6 +75,11 @@ type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["S
 const ProviderRollbackConversationInput = Schema.Struct({
   threadId: ThreadId,
   numTurns: NonNegativeInt,
+});
+
+const ProviderRewindConversationInput = Schema.Struct({
+  threadId: ThreadId,
+  lastTurnId: Schema.optionalKey(TurnId),
 });
 
 function toValidationError(
@@ -1065,6 +1071,54 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
+  const rewindConversation: ProviderServiceMethod<"rewindConversation"> = Effect.fn(
+    "rewindConversation",
+  )(function* (rawInput) {
+    const input = yield* decodeInputOrValidationError({
+      operation: "ProviderService.rewindConversation",
+      schema: ProviderRewindConversationInput,
+      payload: rawInput,
+    });
+    const routed = yield* resolveRoutableSession({
+      threadId: input.threadId,
+      operation: "ProviderService.rewindConversation",
+      allowRecovery: true,
+    });
+    if (
+      routed.adapter.capabilities.conversationRewind !== "fork" ||
+      routed.adapter.rewindThread === undefined
+    ) {
+      return yield* toValidationError(
+        "ProviderService.rewindConversation",
+        `Provider '${routed.adapter.provider}' does not support conversation rewind.`,
+      );
+    }
+    yield* Effect.annotateCurrentSpan({
+      "provider.operation": "rewind-conversation",
+      "provider.kind": routed.adapter.provider,
+      "provider.thread_id": input.threadId,
+      ...(input.lastTurnId ? { "provider.last_turn_id": input.lastTurnId } : {}),
+    });
+    const replacement = yield* routed.adapter.rewindThread(routed.threadId, input.lastTurnId);
+    yield* directory.upsert({
+      threadId: input.threadId,
+      provider: routed.adapter.provider,
+      providerInstanceId: routed.instanceId,
+      status: "running",
+      resumeCursor: replacement.resumeCursor,
+      runtimePayload: {
+        activeTurnId: null,
+        lastRuntimeEvent: "provider.rewindConversation",
+        lastRuntimeEventAt: yield* nowIso,
+      },
+    });
+    yield* analytics.record("provider.conversation.rewound", {
+      provider: routed.adapter.provider,
+      retainedTurn: input.lastTurnId !== undefined,
+    });
+    return replacement;
+  });
+
   const runStopAll = Effect.fn("runStopAll")(function* () {
     const threadIds = yield* directory.listThreadIds();
     const currentAdapters = yield* getAdapterEntries;
@@ -1136,6 +1190,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getCapabilities,
     getInstanceInfo,
     rollbackConversation,
+    rewindConversation,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.

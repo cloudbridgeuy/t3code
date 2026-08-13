@@ -1890,6 +1890,21 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
   };
 
+  const rewindThread: NonNullable<CodexAdapterShape["rewindThread"]> = (threadId, lastTurnId) =>
+    requireSession(threadId).pipe(
+      Effect.flatMap((session) => session.runtime.rewindThread(lastTurnId)),
+      Effect.mapError((cause) =>
+        cause._tag === "ProviderAdapterSessionNotFoundError"
+          ? cause
+          : mapCodexRuntimeError(threadId, "thread/fork", cause),
+      ),
+      Effect.map((snapshot) => ({
+        threadId,
+        turns: snapshot.turns,
+        resumeCursor: { threadId: snapshot.threadId },
+      })),
+    );
+
   const respondToRequest: CodexAdapterShape["respondToRequest"] = (threadId, requestId, decision) =>
     requireSession(threadId).pipe(
       Effect.flatMap((session) => session.runtime.respondToRequest(requestId, decision)),
@@ -1971,12 +1986,14 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session",
+      conversationRewind: "fork",
     },
     startSession,
     sendTurn,
     interruptTurn,
     readThread,
     rollbackThread,
+    rewindThread,
     respondToRequest,
     respondToUserInput,
     stopSession,

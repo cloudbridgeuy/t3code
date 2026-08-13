@@ -1701,6 +1701,7 @@ export function makeOpenCodeAdapter(
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
+        conversationRewind: "unsupported",
       },
       startSession,
       sendTurn,

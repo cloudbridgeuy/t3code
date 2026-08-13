@@ -23,6 +23,7 @@ import type {
   ProviderStopSessionInput,
   ThreadId,
   ProviderTurnStartResult,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -30,6 +31,7 @@ import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type { ProviderConversationRewindResult } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
@@ -104,6 +106,14 @@ export interface ProviderServiceShape {
     readonly threadId: ThreadId;
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
+   * Replace the provider conversation while keeping the T3 thread identity.
+   */
+  readonly rewindConversation: (input: {
+    readonly threadId: ThreadId;
+    readonly lastTurnId?: TurnId;
+  }) => Effect.Effect<ProviderConversationRewindResult, ProviderServiceError>;
 
   /**
    * Canonical provider runtime event stream.
