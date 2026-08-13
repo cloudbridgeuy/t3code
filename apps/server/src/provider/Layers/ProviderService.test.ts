@@ -23,6 +23,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, vi } from "@effect/vitest";
 
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -1003,6 +1004,96 @@ routing.layer("ProviderServiceLive routing", (it) => {
         replacementCursor,
       );
       yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("serializes rewind persistence with a concurrent send", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-rewind-send-race");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+      const rewindEntered = yield* Deferred.make<void>();
+      const allowRewind = yield* Deferred.make<void>();
+      routing.codex.rewindThread.mockImplementationOnce((routedThreadId) =>
+        Deferred.succeed(rewindEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowRewind)),
+          Effect.as({
+            threadId: routedThreadId,
+            turns: [],
+            resumeCursor: { threadId: "replacement-thread" },
+          }),
+        ),
+      );
+      routing.codex.sendTurn.mockClear();
+
+      const rewindFiber = yield* provider.rewindConversation({ threadId }).pipe(Effect.forkChild);
+      yield* Deferred.await(rewindEntered);
+      const sendFiber = yield* provider
+        .sendTurn({ threadId, input: "after rewind", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(routing.codex.sendTurn.mock.calls.length, 0);
+
+      yield* Deferred.succeed(allowRewind, undefined);
+      yield* Fiber.join(rewindFiber);
+      const turn = yield* Fiber.join(sendFiber);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(
+        (binding?.runtimePayload as { activeTurnId?: unknown } | undefined)?.activeTurnId,
+        turn.turnId,
+      );
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("serializes rewind persistence with a concurrent stop", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-rewind-stop-race");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+      const rewindEntered = yield* Deferred.make<void>();
+      const allowRewind = yield* Deferred.make<void>();
+      routing.codex.rewindThread.mockImplementationOnce((routedThreadId) =>
+        Deferred.succeed(rewindEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowRewind)),
+          Effect.as({
+            threadId: routedThreadId,
+            turns: [],
+            resumeCursor: { threadId: "replacement-thread" },
+          }),
+        ),
+      );
+      routing.codex.stopSession.mockClear();
+
+      const rewindFiber = yield* provider.rewindConversation({ threadId }).pipe(Effect.forkChild);
+      yield* Deferred.await(rewindEntered);
+      const stopFiber = yield* provider.stopSession({ threadId }).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(routing.codex.stopSession.mock.calls.length, 0);
+
+      yield* Deferred.succeed(allowRewind, undefined);
+      yield* Fiber.join(rewindFiber);
+      yield* Fiber.join(stopFiber);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(binding?.status, "stopped");
+      assert.equal(
+        (binding?.runtimePayload as { activeTurnId?: unknown } | undefined)?.activeTurnId,
+        null,
+      );
     }),
   );
 
