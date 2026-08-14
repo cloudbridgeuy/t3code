@@ -1,5 +1,7 @@
+import * as Schema from "effect/Schema";
 import { useEffect, useState, type ReactNode } from "react";
 
+import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { useNearViewport } from "../../hooks/useNearViewport";
 import {
   getCachedMermaidRender,
@@ -8,11 +10,18 @@ import {
 } from "../../lib/mermaidRenderer";
 import {
   hasMermaidDiagramToggle,
+  mermaidChromeMode,
+  mermaidDiagramClassName,
   mermaidFailureMessage,
   resolveMermaidView,
   type MermaidRenderState,
+  type MermaidSizeMode,
 } from "./mermaidBlock.logic";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
+
+// A global preference, not per-block: switching one diagram to source and
+// reloading is meant to reopen every mermaid block in source mode.
+const RENDER_MERMAID_STORAGE_KEY = "t3code.renderMermaid";
 
 // Renders the swap from code block to diagram slightly before the block is
 // on screen, so the height change it causes never reflows a visible timeline.
@@ -51,12 +60,16 @@ export function MermaidBlock({
   sourceView: ReactNode;
   fenceClosed: boolean;
 }) {
-  // Known limitation: this resets to `false` on every remount, so toggling
-  // to source mid-stream gets reverted by the next token. Narrow in
-  // practice — once streaming ends the remounts stop and the toggle holds.
-  // A real fix needs the toggle state to survive a remount (a ref, lifted
-  // state, or persistence); not worth adding for a window this short.
-  const [prefersSource, setPrefersSource] = useState(false);
+  // Backed by localStorage (not component state) so the preference survives
+  // this component's frequent mid-stream remounts instead of resetting to
+  // diagram mode on the next token.
+  const [renderMermaidPreferred, setRenderMermaidPreferred] = useLocalStorage(
+    RENDER_MERMAID_STORAGE_KEY,
+    true,
+    Schema.Boolean,
+  );
+  const prefersSource = !renderMermaidPreferred;
+  const [sizeMode, setSizeMode] = useState<MermaidSizeMode>("fit");
   const [renderState, setRenderState] = useState<MermaidRenderState>(
     () =>
       (fenceClosed ? getCachedMermaidRender(source, theme) : undefined) ?? { status: "pending" },
@@ -111,14 +124,16 @@ export function MermaidBlock({
   }, [source, theme, fenceClosed, nearViewport, cacheKey]);
 
   const view = resolveMermaidView({ prefersSource, renderState, fenceClosed });
-  // `exactOptionalPropertyTypes` treats an explicit `mermaidToggle: undefined` as
-  // different from the prop being absent, so the toggle is spread in rather than
-  // passed as `undefined` when there is no diagram yet to toggle to.
-  const mermaidToggleProps = hasMermaidDiagramToggle(renderState)
+  // `exactOptionalPropertyTypes` treats an explicit `mermaid: undefined` as
+  // different from the prop being absent, so the chrome is spread in rather
+  // than passed as `undefined` when there is no diagram yet to toggle to.
+  const mermaidChromeProps = hasMermaidDiagramToggle(renderState)
     ? {
-        mermaidToggle: {
-          showingSource: prefersSource,
-          onToggle: () => setPrefersSource((v) => !v),
+        mermaid: {
+          mode: mermaidChromeMode(view),
+          onToggleMode: () => setRenderMermaidPreferred((v) => !v),
+          sizeMode,
+          onSizeModeChange: setSizeMode,
         },
       }
     : {};
@@ -134,11 +149,11 @@ export function MermaidBlock({
       language="mermaid"
       fenceTitle={fenceTitle}
       theme={theme}
-      {...mermaidToggleProps}
+      {...mermaidChromeProps}
     >
       {view._tag === "Diagram" ? (
         <div
-          className="chat-markdown-mermaid-diagram overflow-x-auto p-3 [&_svg]:h-auto [&_svg]:max-w-full"
+          className={mermaidDiagramClassName(sizeMode)}
           // Safe against untrusted diagram text — mermaid sanitizes its own
           // SVG output at `securityLevel: "strict"`; see mermaidRenderer.ts.
           dangerouslySetInnerHTML={{ __html: view.svg }}

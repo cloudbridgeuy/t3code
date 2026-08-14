@@ -135,6 +135,50 @@ export function hasMermaidDiagramToggle(renderState: MermaidRenderState): boolea
   return renderState.status === "rendered";
 }
 
+/** `fit` scales the SVG down to the panel width (today's default); `natural`
+ * shows it at its own width and leans on the container's `overflow-x-auto`
+ * for horizontal scroll instead. */
+export type MermaidSizeMode = "fit" | "natural";
+
+const MERMAID_DIAGRAM_BASE_CLASS_NAME =
+  "chat-markdown-mermaid-diagram overflow-x-auto p-3 [&_svg]:h-auto";
+
+export function mermaidDiagramClassName(sizeMode: MermaidSizeMode): string {
+  return sizeMode === "fit"
+    ? `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-full`
+    : `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-none`;
+}
+
+/** Which of the two chrome layouts a mermaid block's header should show.
+ * Only an actual `Diagram` view gets the diagram chrome (fit/natural sizing,
+ * no wrap-lines); `Source`, `Pending`, and `Failed` all render the same
+ * source-shaped code block underneath, so they share the source chrome. */
+export type MermaidChromeMode = "diagram" | "source";
+
+export function mermaidChromeMode(view: MermaidView): MermaidChromeMode {
+  return view._tag === "Diagram" ? "diagram" : "source";
+}
+
+/** The header actions `MarkdownCodeBlock` renders before the always-present
+ * copy button. A plain code block (`mermaidMode` absent — either not
+ * mermaid, or mermaid with no diagram yet to toggle to) keeps today's
+ * wrap-lines-only chrome. Diagram mode swaps wrap-lines (meaningless
+ * against an SVG) for the fit/natural size toggle; source mode keeps
+ * wrap-lines and adds the toggle back to the diagram that is known to
+ * exist. */
+export type MarkdownCodeBlockAction = "wrap" | "mermaid-size" | "mermaid-toggle";
+
+export function markdownCodeBlockActions(
+  mermaidMode: MermaidChromeMode | undefined,
+): ReadonlyArray<MarkdownCodeBlockAction> {
+  if (!mermaidMode) {
+    return ["wrap"];
+  }
+  return mermaidMode === "diagram"
+    ? ["mermaid-size", "mermaid-toggle"]
+    : ["wrap", "mermaid-toggle"];
+}
+
 /** Pulls a human-readable message out of whatever a render rejected with.
  * `Error` values read as their `.message`; anything else (a thrown string,
  * a rejected non-Error) is coerced so a failure never surfaces as

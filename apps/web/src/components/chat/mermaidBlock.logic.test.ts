@@ -4,6 +4,9 @@ import {
   hasMermaidDiagramToggle,
   isFenceClosed,
   isMermaidFence,
+  markdownCodeBlockActions,
+  mermaidChromeMode,
+  mermaidDiagramClassName,
   mermaidFailureMessage,
   resolveMermaidView,
 } from "./mermaidBlock.logic";
@@ -209,6 +212,51 @@ describe("hasMermaidDiagramToggle", () => {
     // the diagram that is known to exist, which is why the check is on
     // renderState rather than "not currently showing source".
     expect(hasMermaidDiagramToggle({ status: "rendered", svg: "<svg></svg>" })).toBe(true);
+  });
+});
+
+describe("mermaidDiagramClassName", () => {
+  it("scales the svg down to fit in fit mode", () => {
+    const className = mermaidDiagramClassName("fit");
+    expect(className).toContain("[&_svg]:max-w-full");
+    expect(className).not.toContain("max-w-none");
+  });
+
+  it("leaves the svg at its own width in natural mode", () => {
+    const className = mermaidDiagramClassName("natural");
+    expect(className).toContain("[&_svg]:max-w-none");
+    expect(className).not.toContain("max-w-full");
+  });
+
+  it("keeps the horizontal scroll container in both modes", () => {
+    expect(mermaidDiagramClassName("fit")).toContain("overflow-x-auto");
+    expect(mermaidDiagramClassName("natural")).toContain("overflow-x-auto");
+  });
+});
+
+describe("mermaidChromeMode", () => {
+  it("is diagram only for a rendered Diagram view", () => {
+    expect(mermaidChromeMode({ _tag: "Diagram", svg: "<svg></svg>" })).toBe("diagram");
+  });
+
+  it("is source for Source, Pending, and Failed views", () => {
+    expect(mermaidChromeMode({ _tag: "Source" })).toBe("source");
+    expect(mermaidChromeMode({ _tag: "Pending" })).toBe("source");
+    expect(mermaidChromeMode({ _tag: "Failed", message: "boom" })).toBe("source");
+  });
+});
+
+describe("markdownCodeBlockActions", () => {
+  it("keeps today's wrap-only chrome for an ordinary code block", () => {
+    expect(markdownCodeBlockActions(undefined)).toEqual(["wrap"]);
+  });
+
+  it("swaps wrap-lines for the size toggle in diagram mode", () => {
+    expect(markdownCodeBlockActions("diagram")).toEqual(["mermaid-size", "mermaid-toggle"]);
+  });
+
+  it("keeps wrap-lines and adds the diagram toggle in source mode", () => {
+    expect(markdownCodeBlockActions("source")).toEqual(["wrap", "mermaid-toggle"]);
   });
 });
 
