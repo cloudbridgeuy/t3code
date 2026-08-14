@@ -13,6 +13,7 @@ import {
   ModelSelection,
   NonNegativeInt,
   ThreadId,
+  TurnId,
   ProviderInterruptTurnInput,
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
@@ -29,6 +30,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PartitionedSemaphore from "effect/PartitionedSemaphore";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -74,6 +76,11 @@ type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["S
 const ProviderRollbackConversationInput = Schema.Struct({
   threadId: ThreadId,
   numTurns: NonNegativeInt,
+});
+
+const ProviderRewindConversationInput = Schema.Struct({
+  threadId: ThreadId,
+  lastTurnId: Schema.optionalKey(TurnId),
 });
 
 function toValidationError(
@@ -216,6 +223,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const threadMutationSemaphore = PartitionedSemaphore.makeUnsafe<ThreadId>({ permits: 1 });
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     McpSessionRegistry.issueActiveMcpCredential({ threadId, providerInstanceId }).pipe(
@@ -650,6 +658,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
         return sessionWithInstance;
       }).pipe(
+        threadMutationSemaphore.withPermit(threadId),
         withMetrics({
           counter: providerSessionsTotal,
           attributes: () =>
@@ -759,6 +768,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       return turn;
     }).pipe(
+      threadMutationSemaphore.withPermit(input.threadId),
       withMetrics({
         counter: providerTurnsTotal,
         timer: providerTurnDuration,
@@ -800,6 +810,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           provider: routed.adapter.provider,
         });
       }).pipe(
+        threadMutationSemaphore.withPermit(input.threadId),
         withMetrics({
           counter: providerTurnsTotal,
           outcomeAttributes: () =>
@@ -838,6 +849,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           decision: input.decision,
         });
       }).pipe(
+        threadMutationSemaphore.withPermit(input.threadId),
         withMetrics({
           counter: providerTurnsTotal,
           outcomeAttributes: () =>
@@ -873,6 +885,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       yield* routed.adapter.respondToUserInput(routed.threadId, input.requestId, input.answers);
     }).pipe(
+      threadMutationSemaphore.withPermit(input.threadId),
       withMetrics({
         counter: providerTurnsTotal,
         outcomeAttributes: () =>
@@ -920,6 +933,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           provider: routed.adapter.provider,
         });
       }).pipe(
+        threadMutationSemaphore.withPermit(input.threadId),
         withMetrics({
           counter: providerSessionsTotal,
           outcomeAttributes: () =>
@@ -1055,12 +1069,78 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         turns: input.numTurns,
       });
     }).pipe(
+      threadMutationSemaphore.withPermit(input.threadId),
       withMetrics({
         counter: providerTurnsTotal,
         outcomeAttributes: () =>
           providerMetricAttributes(metricProvider, {
             operation: "rollback",
           }),
+      }),
+    );
+  });
+
+  const rewindConversation: ProviderServiceMethod<"rewindConversation"> = Effect.fn(
+    "rewindConversation",
+  )(function* (rawInput) {
+    const input = yield* decodeInputOrValidationError({
+      operation: "ProviderService.rewindConversation",
+      schema: ProviderRewindConversationInput,
+      payload: rawInput,
+    });
+    return yield* threadMutationSemaphore.withPermit(input.threadId)(
+      Effect.gen(function* () {
+        const routed = yield* resolveRoutableSession({
+          threadId: input.threadId,
+          operation: "ProviderService.rewindConversation",
+          allowRecovery: true,
+        });
+        if (
+          routed.adapter.capabilities.conversationRewind !== "fork" ||
+          routed.adapter.rewindThread === undefined
+        ) {
+          return yield* toValidationError(
+            "ProviderService.rewindConversation",
+            `Provider '${routed.adapter.provider}' does not support conversation rewind.`,
+          );
+        }
+        yield* Effect.annotateCurrentSpan({
+          "provider.operation": "rewind-conversation",
+          "provider.kind": routed.adapter.provider,
+          "provider.thread_id": input.threadId,
+          ...(input.lastTurnId ? { "provider.last_turn_id": input.lastTurnId } : {}),
+        });
+        const replacement = yield* routed.adapter.rewindThread(routed.threadId, input.lastTurnId);
+        yield* directory.upsert({
+          threadId: input.threadId,
+          provider: routed.adapter.provider,
+          providerInstanceId: routed.instanceId,
+          status: "stopped",
+          resumeCursor: replacement.resumeCursor,
+          runtimePayload: {
+            activeTurnId: null,
+            lastRuntimeEvent: "provider.rewindConversation",
+            lastRuntimeEventAt: yield* nowIso,
+          },
+        });
+        const replacementBinding = Option.getOrUndefined(
+          yield* directory.getBinding(input.threadId),
+        );
+        if (!replacementBinding) {
+          return yield* toValidationError(
+            "ProviderService.rewindConversation",
+            `Cannot recover replacement thread '${input.threadId}' because its persisted provider binding is missing.`,
+          );
+        }
+        yield* recoverSessionForThread({
+          binding: replacementBinding,
+          operation: "ProviderService.rewindConversation",
+        });
+        yield* analytics.record("provider.conversation.rewound", {
+          provider: routed.adapter.provider,
+          retainedTurn: input.lastTurnId !== undefined,
+        });
+        return replacement;
       }),
     );
   });
@@ -1136,6 +1216,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getCapabilities,
     getInstanceInfo,
     rollbackConversation,
+    rewindConversation,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.

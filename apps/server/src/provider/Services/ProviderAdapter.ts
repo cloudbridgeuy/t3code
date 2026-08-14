@@ -24,12 +24,17 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
+export type ProviderConversationRewindMode = "fork" | "unsupported";
 
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /**
+   * Declares whether an existing conversation can be replaced with a fork.
+   */
+  readonly conversationRewind: ProviderConversationRewindMode;
 }
 
 export interface ProviderThreadTurnSnapshot {
@@ -40,6 +45,10 @@ export interface ProviderThreadTurnSnapshot {
 export interface ProviderThreadSnapshot {
   readonly threadId: ThreadId;
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
+}
+
+export interface ProviderConversationRewindResult extends ProviderThreadSnapshot {
+  readonly resumeCursor: unknown;
 }
 
 export interface ProviderAdapterShape<TError> {
@@ -113,6 +122,15 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
+
+  /**
+   * Replace the provider conversation with a fresh thread or a fork through
+   * the requested completed turn.
+   */
+  readonly rewindThread?: (
+    threadId: ThreadId,
+    lastTurnId?: TurnId,
+  ) => Effect.Effect<ProviderConversationRewindResult, TError>;
 
   /**
    * Stop all sessions owned by this adapter.

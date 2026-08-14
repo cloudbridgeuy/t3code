@@ -109,7 +109,8 @@ function createProviderServiceHarness() {
     respondToUserInput: () => unsupported(),
     stopSession: () => unsupported(),
     listSessions: () => Effect.succeed([...runtimeSessions]),
-    getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+    getCapabilities: () =>
+      Effect.succeed({ sessionModelSwitch: "in-session", conversationRewind: "unsupported" }),
     getInstanceInfo: (instanceId) => {
       const driverKind = ProviderDriverKind.make(String(instanceId));
       return Effect.succeed({
@@ -124,6 +125,7 @@ function createProviderServiceHarness() {
       });
     },
     rollbackConversation: () => unsupported(),
+    rewindConversation: () => unsupported(),
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
     },

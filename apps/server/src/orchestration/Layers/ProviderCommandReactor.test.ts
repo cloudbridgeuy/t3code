@@ -319,6 +319,7 @@ describe("ProviderCommandReactor", () => {
       getCapabilities: (_provider) =>
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
+          conversationRewind: "unsupported",
         }),
       getInstanceInfo: (instanceId) => {
         const raw = String(instanceId);
@@ -340,6 +341,7 @@ describe("ProviderCommandReactor", () => {
         });
       },
       rollbackConversation: () => unsupported(),
+      rewindConversation: () => unsupported(),
       get streamEvents() {
         return Stream.fromPubSub(runtimeEventPubSub);
       },

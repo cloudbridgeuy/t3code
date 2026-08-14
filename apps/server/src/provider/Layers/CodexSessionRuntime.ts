@@ -59,6 +59,8 @@ const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "unknown thread",
   "does not exist",
 ];
+const CODEX_CHILD_INTERRUPT_TIMEOUT = "3 seconds" as const;
+const CODEX_CHILD_INTERRUPT_BATCH_TIMEOUT = "10 seconds" as const;
 
 export function hasConfiguredMcpServer(appServerArgs: ReadonlyArray<string> | undefined): boolean {
   return appServerArgs?.some((argument) => argument.includes("mcp_servers.")) === true;
@@ -91,7 +93,8 @@ export type CodexResumeCursor = typeof CodexResumeCursorSchema.Type;
 type CodexServiceTier = NonNullable<EffectCodexSchema.V2ThreadStartParams["serviceTier"]>;
 type CodexThreadItem =
   | EffectCodexSchema.V2ThreadReadResponse["thread"]["turns"][number]["items"][number]
-  | EffectCodexSchema.V2ThreadRollbackResponse["thread"]["turns"][number]["items"][number];
+  | EffectCodexSchema.V2ThreadRollbackResponse["thread"]["turns"][number]["items"][number]
+  | EffectCodexSchema.V2ThreadForkResponse["thread"]["turns"][number]["items"][number];
 
 export interface CodexSessionRuntimeOptions {
   readonly threadId: ThreadId;
@@ -106,6 +109,8 @@ export interface CodexSessionRuntimeOptions {
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
   readonly appServerArgs?: ReadonlyArray<string>;
+  readonly _testClosePendingRequestsGate?: Effect.Effect<void>;
+  readonly _testClosePendingRequestsSettledGate?: Effect.Effect<void>;
 }
 
 export interface CodexSessionRuntimeSendTurnInput {
@@ -138,6 +143,9 @@ export interface CodexSessionRuntimeShape {
   ) => Effect.Effect<ProviderTurnStartResult, CodexSessionRuntimeError>;
   readonly interruptTurn: (turnId?: TurnId) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly readThread: Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
+  readonly createRewindTarget: (
+    lastTurnId?: TurnId,
+  ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
   readonly rollbackThread: (
     numTurns: number,
   ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
@@ -158,6 +166,7 @@ export type CodexSessionRuntimeError =
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
   | CodexSessionRuntimeInvalidUserInputAnswersError
+  | CodexSessionRuntimeInvalidRetainedTurnError
   | CodexSessionRuntimeThreadIdMissingError;
 
 export class CodexSessionRuntimePendingApprovalNotFoundError extends Schema.TaggedErrorClass<CodexSessionRuntimePendingApprovalNotFoundError>()(
@@ -204,9 +213,22 @@ export class CodexSessionRuntimeThreadIdMissingError extends Schema.TaggedErrorC
   }
 }
 
+export class CodexSessionRuntimeInvalidRetainedTurnError extends Schema.TaggedErrorClass<CodexSessionRuntimeInvalidRetainedTurnError>()(
+  "CodexSessionRuntimeInvalidRetainedTurnError",
+  {
+    turnId: Schema.String,
+    reason: Schema.Literals(["not-found", "not-completed"]),
+  },
+) {
+  override get message(): string {
+    return this.reason === "not-found"
+      ? `Codex thread does not contain retained turn '${this.turnId}'`
+      : `Codex retained turn '${this.turnId}' is not completed`;
+  }
+}
+
 interface PendingApproval {
   readonly requestId: ApprovalRequestId;
-  readonly jsonRpcId: string;
   readonly requestKind: ProviderRequestKind;
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
@@ -225,6 +247,11 @@ interface PendingUserInput {
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
   readonly answers: Deferred.Deferred<ProviderUserInputAnswers>;
+}
+
+interface PendingRequests {
+  readonly approvals: Map<ApprovalRequestId, PendingApproval>;
+  readonly userInputs: Map<ApprovalRequestId, PendingUserInput>;
 }
 
 type CodexServerNotification = {
@@ -492,6 +519,145 @@ export const openCodexThread = (input: {
       ),
     );
 };
+
+export type CodexRewindPlan =
+  | { readonly _tag: "start" }
+  | { readonly _tag: "fork"; readonly lastTurnId: string }
+  | {
+      readonly _tag: "invalid";
+      readonly turnId: string;
+      readonly reason: "not-found" | "not-completed";
+    };
+
+export function resolveCodexRewindPlan(
+  turns: ReadonlyArray<{ readonly id: string; readonly status: string }>,
+  lastTurnId: TurnId | undefined,
+): CodexRewindPlan {
+  if (lastTurnId === undefined) {
+    return { _tag: "start" };
+  }
+  const retained = turns.find((turn) => turn.id === lastTurnId);
+  if (!retained) {
+    return { _tag: "invalid", turnId: lastTurnId, reason: "not-found" };
+  }
+  if (retained.status !== "completed") {
+    return { _tag: "invalid", turnId: lastTurnId, reason: "not-completed" };
+  }
+  return { _tag: "fork", lastTurnId };
+}
+
+export function isCodexTurnNoLongerActiveError(error: CodexErrors.CodexAppServerError): boolean {
+  if (error._tag !== "CodexAppServerRequestError") {
+    return false;
+  }
+  const message = error.errorMessage.toLowerCase();
+  return (
+    message.includes("already completed") ||
+    message.includes("already finished") ||
+    message.includes("not active") ||
+    message.includes("not in progress") ||
+    message.includes("no active turn") ||
+    (message.includes("cannot interrupt") &&
+      (message.includes("completed") || message.includes("finished")))
+  );
+}
+
+export function resolveCodexTurnCompletionSessionUpdate(input: {
+  readonly currentActiveTurnId: TurnId | undefined;
+  readonly completedTurnId: string;
+  readonly failed: boolean;
+  readonly lastError: string | undefined;
+}): Partial<ProviderSession> {
+  if (input.currentActiveTurnId !== input.completedTurnId) {
+    return {};
+  }
+  return {
+    status: input.failed ? "error" : "ready",
+    activeTurnId: undefined,
+    ...(input.lastError ? { lastError: input.lastError } : {}),
+  };
+}
+
+type CodexThreadRewindMethod = "thread/read" | "turn/interrupt" | "thread/fork" | "thread/start";
+
+interface CodexThreadRewindClient {
+  readonly request: <M extends CodexThreadRewindMethod>(
+    method: M,
+    payload: CodexRpc.ClientRequestParamsByMethod[M],
+  ) => Effect.Effect<CodexRpc.ClientRequestResponsesByMethod[M], CodexErrors.CodexAppServerError>;
+}
+
+function interruptCodexLiveTurns(
+  client: CodexThreadRewindClient,
+  liveTurns: ReadonlyMap<string, string>,
+): Effect.Effect<void> {
+  return Effect.forEach(
+    Array.from(liveTurns.entries()),
+    ([childThreadId, childTurnId]) =>
+      client
+        .request("turn/interrupt", {
+          threadId: childThreadId,
+          turnId: childTurnId,
+        })
+        .pipe(Effect.timeoutOption(CODEX_CHILD_INTERRUPT_TIMEOUT), Effect.ignore),
+    { concurrency: 8, discard: true },
+  ).pipe(Effect.timeoutOption(CODEX_CHILD_INTERRUPT_BATCH_TIMEOUT), Effect.ignore);
+}
+
+export const createCodexRewindTarget = Effect.fn("CodexSessionRuntime.createRewindTarget")(
+  function* (
+    input: {
+      readonly client: CodexThreadRewindClient;
+      readonly getSession: Effect.Effect<ProviderSession>;
+      readonly runtimeMode: RuntimeMode;
+      readonly cwd: string;
+      readonly model: string | undefined;
+      readonly serviceTier: CodexServiceTier | undefined;
+    },
+    lastTurnId?: TurnId,
+  ): Effect.fn.Return<
+    CodexThreadSnapshot,
+    | CodexErrors.CodexAppServerError
+    | CodexSessionRuntimeInvalidRetainedTurnError
+    | CodexSessionRuntimeThreadIdMissingError
+  > {
+    const session = yield* input.getSession;
+    const sourceThreadId = currentProviderThreadId(session);
+    if (sourceThreadId === undefined) {
+      return yield* new CodexSessionRuntimeThreadIdMissingError({ threadId: session.threadId });
+    }
+
+    const source = yield* input.client.request("thread/read", {
+      threadId: sourceThreadId,
+      includeTurns: true,
+    });
+    const plan = resolveCodexRewindPlan(source.thread.turns, lastTurnId);
+    if (plan._tag === "invalid") {
+      return yield* new CodexSessionRuntimeInvalidRetainedTurnError({
+        turnId: plan.turnId,
+        reason: plan.reason,
+      });
+    }
+
+    const replacement =
+      plan._tag === "fork"
+        ? yield* input.client.request("thread/fork", {
+            threadId: sourceThreadId,
+            lastTurnId: plan.lastTurnId,
+          })
+        : yield* input.client.request(
+            "thread/start",
+            buildThreadStartParams({
+              cwd: input.cwd,
+              runtimeMode: input.runtimeMode,
+              model: input.model,
+              serviceTier: input.serviceTier,
+            }),
+          );
+
+    return parseThreadSnapshot(replacement);
+  },
+);
 
 function readNotificationThreadId(notification: CodexServerNotification): string | undefined {
   switch (notification.method) {
@@ -827,7 +993,11 @@ function updateSession(
 }
 
 function parseThreadSnapshot(
-  response: EffectCodexSchema.V2ThreadReadResponse | EffectCodexSchema.V2ThreadRollbackResponse,
+  response:
+    | EffectCodexSchema.V2ThreadReadResponse
+    | EffectCodexSchema.V2ThreadRollbackResponse
+    | EffectCodexSchema.V2ThreadForkResponse
+    | EffectCodexSchema.V2ThreadStartResponse,
 ): CodexThreadSnapshot {
   return {
     threadId: response.thread.id,
@@ -850,9 +1020,31 @@ export const makeCodexSessionRuntime = (
     const runtimeScope = yield* Scope.Scope;
     const crypto = yield* Crypto.Crypto;
     const events = yield* Queue.unbounded<ProviderEvent>();
-    const pendingApprovalsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingApproval>());
+    const pendingRequestsRef = yield* Ref.make<PendingRequests>({
+      approvals: new Map(),
+      userInputs: new Map(),
+    });
+    const claimPendingApproval = (requestId: ApprovalRequestId) =>
+      Ref.modify(pendingRequestsRef, (current) => {
+        const pending = current.approvals.get(requestId);
+        if (!pending) {
+          return [undefined, current] as const;
+        }
+        const approvals = new Map(current.approvals);
+        approvals.delete(requestId);
+        return [pending, { ...current, approvals }] as const;
+      });
+    const claimPendingUserInput = (requestId: ApprovalRequestId) =>
+      Ref.modify(pendingRequestsRef, (current) => {
+        const pending = current.userInputs.get(requestId);
+        if (!pending) {
+          return [undefined, current] as const;
+        }
+        const userInputs = new Map(current.userInputs);
+        userInputs.delete(requestId);
+        return [pending, { ...current, userInputs }] as const;
+      });
     const approvalCorrelationsRef = yield* Ref.make(new Map<string, ApprovalCorrelation>());
-    const pendingUserInputsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingUserInput>());
     const collabReceiverTurnsRef = yield* Ref.make(new Map<string, TurnId>());
     const collabChildAgentsRef = yield* Ref.make(new Map<string, CollabChildAgentState>());
     /** Child provider-thread id → its currently running provider turn id. */
@@ -949,28 +1141,46 @@ export const makeCodexSessionRuntime = (
         message,
       });
 
-    const settlePendingApprovals = (decision: ProviderApprovalDecision) =>
-      Ref.get(pendingApprovalsRef).pipe(
-        Effect.flatMap((pendingApprovals) =>
+    const settlePendingRequests = (
+      decision: ProviderApprovalDecision,
+      answers: ProviderUserInputAnswers,
+    ) =>
+      Ref.modify(pendingRequestsRef, (pending) => [
+        pending,
+        { approvals: new Map(), userInputs: new Map() },
+      ]).pipe(
+        Effect.tap(() => options._testClosePendingRequestsGate ?? Effect.void),
+        Effect.flatMap((pending) =>
           Effect.forEach(
-            Array.from(pendingApprovals.values()),
+            Array.from(pending.approvals.values()),
             (pendingApproval) =>
               Deferred.succeed(pendingApproval.decision, decision).pipe(Effect.ignore),
             { discard: true },
+          ).pipe(
+            Effect.andThen(
+              Effect.forEach(
+                Array.from(pending.userInputs.values()),
+                (pendingUserInput) =>
+                  Deferred.succeed(pendingUserInput.answers, answers).pipe(Effect.ignore),
+                { discard: true },
+              ),
+            ),
           ),
         ),
+        Effect.tap(() => options._testClosePendingRequestsSettledGate ?? Effect.void),
       );
 
-    const settlePendingUserInputs = (answers: ProviderUserInputAnswers) =>
-      Ref.get(pendingUserInputsRef).pipe(
-        Effect.flatMap((pendingUserInputs) =>
-          Effect.forEach(
-            Array.from(pendingUserInputs.values()),
-            (pendingUserInput) =>
-              Deferred.succeed(pendingUserInput.answers, answers).pipe(Effect.ignore),
-            { discard: true },
-          ),
-        ),
+    const createRewindTargetForSession = (lastTurnId?: TurnId) =>
+      createCodexRewindTarget(
+        {
+          client,
+          getSession: Ref.get(sessionRef),
+          runtimeMode: options.runtimeMode,
+          cwd: options.cwd,
+          model: options.model,
+          serviceTier: options.serviceTier,
+        },
+        lastTurnId,
       );
 
     /**
@@ -1407,11 +1617,14 @@ export const makeCodexSessionRuntime = (
             payload.turn.status === "failed" && "error" in payload.turn && payload.turn.error
               ? payload.turn.error.message
               : undefined;
-          return updateSession(sessionRef, {
-            status: payload.turn.status === "failed" ? "error" : "ready",
-            activeTurnId: undefined,
-            ...(lastError ? { lastError } : {}),
-          });
+          return updateSession(sessionRef, (session) =>
+            resolveCodexTurnCompletionSessionUpdate({
+              currentActiveTurnId: session.activeTurnId,
+              completedTurnId: payload.turn.id,
+              failed: payload.turn.status === "failed",
+              lastError,
+            }),
+          );
         }),
       ),
     );
@@ -1440,17 +1653,16 @@ export const makeCodexSessionRuntime = (
         const itemId = ProviderItemId.make(payload.itemId);
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
 
-        yield* Ref.update(pendingApprovalsRef, (current) => {
-          const next = new Map(current);
+        yield* Ref.update(pendingRequestsRef, (current) => {
+          const next = new Map(current.approvals);
           next.set(requestId, {
             requestId,
-            jsonRpcId: payload.approvalId ?? payload.itemId,
             requestKind: "command",
             turnId,
             itemId,
             decision,
           });
-          return next;
+          return { ...current, approvals: next };
         });
         yield* Ref.update(approvalCorrelationsRef, (current) => {
           const next = new Map(current);
@@ -1476,10 +1688,10 @@ export const makeCodexSessionRuntime = (
 
         const resolved = yield* Deferred.await(decision).pipe(
           Effect.ensuring(
-            Ref.update(pendingApprovalsRef, (current) => {
-              const next = new Map(current);
+            Ref.update(pendingRequestsRef, (current) => {
+              const next = new Map(current.approvals);
               next.delete(requestId);
-              return next;
+              return { ...current, approvals: next };
             }),
           ),
         );
@@ -1498,17 +1710,16 @@ export const makeCodexSessionRuntime = (
         const itemId = ProviderItemId.make(payload.itemId);
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
 
-        yield* Ref.update(pendingApprovalsRef, (current) => {
-          const next = new Map(current);
+        yield* Ref.update(pendingRequestsRef, (current) => {
+          const next = new Map(current.approvals);
           next.set(requestId, {
             requestId,
-            jsonRpcId: payload.itemId,
             requestKind: "file-change",
             turnId,
             itemId,
             decision,
           });
-          return next;
+          return { ...current, approvals: next };
         });
         yield* Ref.update(approvalCorrelationsRef, (current) => {
           const next = new Map(current);
@@ -1534,10 +1745,10 @@ export const makeCodexSessionRuntime = (
 
         const resolved = yield* Deferred.await(decision).pipe(
           Effect.ensuring(
-            Ref.update(pendingApprovalsRef, (current) => {
-              const next = new Map(current);
+            Ref.update(pendingRequestsRef, (current) => {
+              const next = new Map(current.approvals);
               next.delete(requestId);
-              return next;
+              return { ...current, approvals: next };
             }),
           ),
         );
@@ -1554,15 +1765,15 @@ export const makeCodexSessionRuntime = (
         const itemId = ProviderItemId.make(payload.itemId);
         const answers = yield* Deferred.make<ProviderUserInputAnswers>();
 
-        yield* Ref.update(pendingUserInputsRef, (current) => {
-          const next = new Map(current);
+        yield* Ref.update(pendingRequestsRef, (current) => {
+          const next = new Map(current.userInputs);
           next.set(requestId, {
             requestId,
             turnId,
             itemId,
             answers,
           });
-          return next;
+          return { ...current, userInputs: next };
         });
 
         yield* emitEvent({
@@ -1577,14 +1788,13 @@ export const makeCodexSessionRuntime = (
 
         const resolvedAnswers = yield* Deferred.await(answers).pipe(
           Effect.ensuring(
-            Ref.update(pendingUserInputsRef, (current) => {
-              const next = new Map(current);
+            Ref.update(pendingRequestsRef, (current) => {
+              const next = new Map(current.userInputs);
               next.delete(requestId);
-              return next;
+              return { ...current, userInputs: next };
             }),
           ),
         );
-
         return {
           answers: yield* toCodexUserInputAnswers(resolvedAnswers).pipe(
             Effect.mapError((error) =>
@@ -1722,26 +1932,27 @@ export const makeCodexSessionRuntime = (
       return providerThreadId;
     });
 
-    const close = Effect.gen(function* () {
-      const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
-      if (alreadyClosed) {
-        return;
-      }
-      yield* settlePendingApprovals("cancel");
-      yield* settlePendingUserInputs({});
-      yield* updateSession(sessionRef, {
-        status: "closed",
-        activeTurnId: undefined,
-      });
-      yield* emitSessionEvent("session/closed", "Session stopped").pipe(
-        Effect.catch((cause) =>
-          Effect.logError("Failed to emit Codex session closed event.", { cause }),
-        ),
-      );
-      yield* Scope.close(runtimeScope, Exit.void);
-      yield* Queue.shutdown(serverNotifications);
-      yield* Queue.shutdown(events);
-    });
+    const close = Effect.uninterruptible(
+      Effect.gen(function* () {
+        const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
+        if (alreadyClosed) {
+          return;
+        }
+        yield* settlePendingRequests("cancel", {});
+        yield* updateSession(sessionRef, {
+          status: "closed",
+          activeTurnId: undefined,
+        });
+        yield* emitSessionEvent("session/closed", "Session stopped").pipe(
+          Effect.catch((cause) =>
+            Effect.logError("Failed to emit Codex session closed event.", { cause }),
+          ),
+        );
+        yield* Scope.close(runtimeScope, Exit.void);
+        yield* Queue.shutdown(serverNotifications);
+        yield* Queue.shutdown(events);
+      }),
+    );
 
     return {
       start,
@@ -1812,17 +2023,7 @@ export const makeCodexSessionRuntime = (
           // (review finding). Per-child and overall deadlines guarantee the
           // parent interrupt below always runs.
           const liveChildTurns = yield* Ref.get(collabChildLiveTurnsRef);
-          yield* Effect.forEach(
-            Array.from(liveChildTurns.entries()),
-            ([childThreadId, childTurnId]) =>
-              client
-                .request("turn/interrupt", {
-                  threadId: childThreadId,
-                  turnId: childTurnId,
-                })
-                .pipe(Effect.timeoutOption("3 seconds"), Effect.ignore),
-            { concurrency: 8, discard: true },
-          ).pipe(Effect.timeoutOption("10 seconds"), Effect.ignore);
+          yield* interruptCodexLiveTurns(client, liveChildTurns);
           const effectiveTurnId = turnId ?? session.activeTurnId;
           if (!effectiveTurnId) {
             return;
@@ -1840,6 +2041,7 @@ export const makeCodexSessionRuntime = (
         });
         return parseThreadSnapshot(response);
       }),
+      createRewindTarget: createRewindTargetForSession,
       rollbackThread: (numTurns) =>
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;
@@ -1855,17 +2057,12 @@ export const makeCodexSessionRuntime = (
         }),
       respondToRequest: (requestId, decision) =>
         Effect.gen(function* () {
-          const pending = (yield* Ref.get(pendingApprovalsRef)).get(requestId);
+          const pending = yield* claimPendingApproval(requestId);
           if (!pending) {
             return yield* new CodexSessionRuntimePendingApprovalNotFoundError({
               requestId,
             });
           }
-          yield* Ref.update(pendingApprovalsRef, (current) => {
-            const next = new Map(current);
-            next.delete(requestId);
-            return next;
-          });
           yield* Deferred.succeed(pending.decision, decision);
           yield* emitEvent({
             kind: "notification",
@@ -1884,26 +2081,29 @@ export const makeCodexSessionRuntime = (
         }),
       respondToUserInput: (requestId, answers) =>
         Effect.gen(function* () {
-          const pending = (yield* Ref.get(pendingUserInputsRef)).get(requestId);
+          const pending = (yield* Ref.get(pendingRequestsRef)).userInputs.get(requestId);
           if (!pending) {
             return yield* new CodexSessionRuntimePendingUserInputNotFoundError({
               requestId,
             });
           }
+          // Validate before removal so invalid answers do not lose the
+          // pending request and the user can retry.
           const codexAnswers = yield* toCodexUserInputAnswers(answers);
-          yield* Ref.update(pendingUserInputsRef, (current) => {
-            const next = new Map(current);
-            next.delete(requestId);
-            return next;
-          });
-          yield* Deferred.succeed(pending.answers, answers);
+          const claimedPending = yield* claimPendingUserInput(requestId);
+          if (!claimedPending) {
+            return yield* new CodexSessionRuntimePendingUserInputNotFoundError({
+              requestId,
+            });
+          }
+          yield* Deferred.succeed(claimedPending.answers, answers);
           yield* emitEvent({
             kind: "notification",
             threadId: options.threadId,
             method: "item/tool/requestUserInput/answered",
-            requestId: pending.requestId,
-            ...(pending.turnId ? { turnId: pending.turnId } : {}),
-            ...(pending.itemId ? { itemId: pending.itemId } : {}),
+            requestId: claimedPending.requestId,
+            ...(claimedPending.turnId ? { turnId: claimedPending.turnId } : {}),
+            ...(claimedPending.itemId ? { itemId: claimedPending.itemId } : {}),
             payload: {
               answers: codexAnswers,
             },
