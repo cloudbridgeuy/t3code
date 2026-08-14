@@ -43,12 +43,12 @@ function ensureInitialized(mermaid: Mermaid, theme: "light" | "dark"): void {
   }
   mermaid.initialize({
     startOnLoad: false,
-    // Strict mode sanitizes mermaid's own SVG output — a real rendered SVG
-    // was inspected and confirmed an injected <script> element was stripped
-    // outright — which is what makes injecting that output via
-    // dangerouslySetInnerHTML safe for untrusted agent-authored diagram
-    // text. It does not disable HTML labels: those still render as real
-    // HTML (<div>/<p>) inside <foreignObject>.
+    // Strict mode sanitizes mermaid's own SVG output — verified by
+    // inspecting a rendered SVG from malicious input, whose injected
+    // <script> was stripped outright. That sanitization, not HTML labels
+    // (still enabled; they render inside <foreignObject>), is what makes
+    // injecting the result via dangerouslySetInnerHTML safe for untrusted
+    // diagram text.
     securityLevel: "strict",
     theme: mermaidThemeFor(theme),
   });
@@ -60,21 +60,19 @@ let renderIdCounter = 0;
 type MermaidRenderResult = Extract<MermaidRenderState, { status: "rendered" | "failed" }>;
 
 /**
- * Memoizes `renderMermaidDiagram` by its two inputs — mermaid's `render()`
- * is a pure function of diagram source and theme, so the same pair always
- * produces the same SVG (or the same failure).
+ * Memoizes `renderMermaidDiagram` by source and theme, since `render()` is a
+ * pure function of both.
  *
  * This exists because `ChatMarkdown`'s `markdownComponents` memo depends on
- * `text`, which grows with every streamed token: that gives the `pre`
- * override a new function identity per token, and React remounts
- * `MermaidBlock` at that position on every remaining token once the fence
- * has closed. Without this cache, every one of those remounts would redo a
- * full mermaid parse+render. `getCachedMermaidRender` lets `MermaidBlock`
- * seed its state from an already-known result so a remount reads the cache
- * instead of flashing back to pending.
+ * the full message `text`, which grows with every streamed token: that gives
+ * the `pre` override a new identity per token, and React remounts
+ * `MermaidBlock` on every remaining token once its fence has closed. Without
+ * this cache, every one of those remounts would redo a full parse+render;
+ * `getCachedMermaidRender` lets `MermaidBlock` seed its state from an
+ * already-known result instead of flashing back to pending.
  *
- * Unbounded by design — V3 replaces this with a bounded LRU. Keep this
- * simple enough to delete outright when that lands.
+ * Unbounded by design; a bounded LRU is meant to replace it later, so keep
+ * this simple enough to delete outright when that lands.
  */
 const renderCache = new Map<string, MermaidRenderResult>();
 
@@ -92,21 +90,18 @@ export function getCachedMermaidRender(
 }
 
 /**
- * `renderCache` above only helps once a render has *settled* — it does
- * nothing for the window while the first render for a given `(source,
- * theme)` is still in flight. And that window is not short: it awaits
- * `loadMermaidModule()`, a ~670 kB import on the first diagram in a session.
- * Every token that streams in during that time remounts `MermaidBlock`
- * (see its class comment), missing `renderCache` and calling
- * `renderMermaidDiagram` again — without this, that would mean dozens of
- * concurrent `parse`+`render` calls for the exact same input.
+ * `renderCache` only helps once a render has settled, not during the window
+ * a first render for a given `(source, theme)` is still in flight — and that
+ * window is not short, since it awaits `loadMermaidModule()`'s ~670 kB
+ * import. Every token that streams in during that window remounts
+ * `MermaidBlock`, missing `renderCache` and calling `renderMermaidDiagram`
+ * again; without this map, that would mean dozens of concurrent parse+render
+ * calls for the same input.
  *
- * Mirrors `loadMermaidModule` above: cache the in-flight promise, not the
- * resolved value, keyed the same way as `renderCache`, and always evict it
- * once the promise settles — on success the result already lives in
- * `renderCache` so there's nothing left to reuse here, and on rejection
- * (loader failure or a `render()` throw) evicting is what keeps the failure
- * retryable instead of replaying it forever.
+ * Keyed the same way as `renderCache` and always evicted once the promise
+ * settles: on success the result already lives in `renderCache`, and on
+ * rejection (loader failure or a `render()` throw) evicting is what keeps
+ * the failure retryable instead of replaying it forever.
  */
 const inFlightRenders = new Map<string, Promise<MermaidRenderResult>>();
 

@@ -1,15 +1,12 @@
 /**
- * Pure decisions for rendering a mermaid fence as a diagram: which fence
- * languages count as mermaid, and what a mermaid block should show given its
- * current mode and render progress. No DOM access, no mermaid import — the
- * shell (MermaidBlock.tsx, lib/mermaidRenderer.ts) owns every effect.
+ * Decides which fence languages count as mermaid, and what a mermaid block
+ * should show given its current mode and render progress.
  */
 
 const MERMAID_FENCE_LANGUAGE = "mermaid";
 
-/** `language` is already normalized by `extractFenceLanguage` (lowercased is
- * not guaranteed — fence text keeps its original case), so this still trims
- * and lowercases defensively before comparing. */
+/** `extractFenceLanguage` returns the fence language as typed, so this trims
+ * and lowercases before comparing. */
 export function isMermaidFence(language: string): boolean {
   return language.trim().toLowerCase() === MERMAID_FENCE_LANGUAGE;
 }
@@ -24,6 +21,10 @@ export interface MermaidFencePosition {
   readonly end?: { readonly offset?: number | undefined };
 }
 
+/** Matches a line's leading run of three-or-more backticks or three-or-more
+ * tildes, capturing that run. Used to find which marker opened a fence and
+ * how long it was, because CommonMark requires the closing run to use the
+ * same character and be at least as long. */
 const FENCE_MARKER_PATTERN = /^(`{3,}|~{3,})/;
 
 /**
@@ -35,9 +36,8 @@ const FENCE_MARKER_PATTERN = /^(`{3,}|~{3,})/;
  * of backticks or tildes — until the closing fence has actually arrived.
  *
  * When `position` (or either offset) is missing, there is nothing to check
- * against, so this falls back to `!isStreaming` — byte-for-byte V1's
- * behavior: a finished message can never have an open fence, and a
- * still-streaming one might.
+ * against, so this falls back to `!isStreaming`: a finished message can
+ * never have an open fence, and a still-streaming one might.
  */
 export function isFenceClosed(
   text: string,

@@ -10,26 +10,16 @@ import {
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 
 /**
- * A mermaid fence, in one of two modes: the drawn diagram, or its source —
- * the same source text `MarkdownCodeBlock`'s copy button already writes to
- * the clipboard. `sourceView` is the caller's already-built Shiki code block
- * (the same one a non-mermaid fence renders), reused here so source mode
- * looks and behaves exactly like a normal code block.
+ * A mermaid fence, in one of two modes: the drawn diagram, or `sourceView`
+ * (the caller's already-built Shiki block, reused so source mode looks like
+ * a normal code block). The render effect only runs once `fenceClosed` is
+ * true, so a still-streaming fence is never handed to mermaid as a diagram.
  *
- * `fenceClosed` is the caller's answer to "has the closing fence for this
- * block actually arrived yet" — while streaming, this component mounts and
- * re-renders on every token, but `source` (the partial fence text) is not
- * something to attempt to render as a diagram. The render effect is gated on
- * `fenceClosed` so it never fires on partial source, and fires exactly once
- * when the fence closes (assuming `source`/`theme` are otherwise stable).
- *
- * That "otherwise stable" caveat matters more than it looks: the caller's
- * `pre` override is rebuilt on every streamed token (its memo depends on the
- * full message `text`), so once the fence has closed, React remounts this
- * component fresh on every subsequent token instead of just re-rendering it.
- * `renderState`'s initial value is seeded from `getCachedMermaidRender` so a
- * remount that already has a known result skips straight to it — no
- * pending flash, no repeat mermaid.render() call. See `mermaidRenderer.ts`.
+ * `ChatMarkdown` remounts this component on every streamed token once the
+ * fence has closed, so `renderState` seeds from `getCachedMermaidRender`: a
+ * cache hit skips straight to the known result instead of flashing back to
+ * pending. See `mermaidRenderer.ts` for why that remount happens and how the
+ * cache handles it.
  */
 export function MermaidBlock({
   source,
@@ -44,14 +34,11 @@ export function MermaidBlock({
   sourceView: ReactNode;
   fenceClosed: boolean;
 }) {
-  // Known limitation: this resets to `false` on every remount (see the class
-  // comment above), so a "Show source" click while trailing tokens are still
-  // streaming gets reverted by the next token. Narrow in practice — once
-  // streaming ends, `text` stops changing, the remounts stop, and the toggle
-  // holds. Not fixed here: a real fix needs the toggle state to survive a
-  // remount (a ref, lifted state, or persistence), which is V4's persisted
-  // mermaid mode to own. Adding a temporary mechanism here only to delete it
-  // in V4 is not worth the churn.
+  // Known limitation: this resets to `false` on every remount, so toggling
+  // to source mid-stream gets reverted by the next token. Narrow in
+  // practice — once streaming ends the remounts stop and the toggle holds.
+  // A real fix needs the toggle state to survive a remount (a ref, lifted
+  // state, or persistence); not worth adding for a window this short.
   const [prefersSource, setPrefersSource] = useState(false);
   const [renderState, setRenderState] = useState<MermaidRenderState>(
     () =>
@@ -62,12 +49,10 @@ export function MermaidBlock({
     if (!fenceClosed) {
       return;
     }
-    // A remount (see the class comment above) re-runs this effect for a
-    // source/theme pair that may already be cached. Reusing the cached
-    // result here — instead of unconditionally resetting to pending first —
-    // is what actually prevents the flash: `setRenderState` with the exact
-    // object `getCachedMermaidRender` already seeded as the initial state is
-    // a no-op render (React bails via Object.is on the unchanged reference).
+    // Reusing the cached result here, instead of resetting to pending
+    // first, is what prevents the flash: `setRenderState` with the same
+    // object `getCachedMermaidRender` already seeded as initial state is a
+    // no-op render (React bails via Object.is on the unchanged reference).
     const cached = getCachedMermaidRender(source, theme);
     if (cached) {
       setRenderState(cached);
@@ -115,12 +100,8 @@ export function MermaidBlock({
       {view._tag === "Diagram" ? (
         <div
           className="chat-markdown-mermaid-diagram overflow-x-auto p-3 [&_svg]:h-auto [&_svg]:max-w-full"
-          // Safe against untrusted diagram text: renderMermaidDiagram always
-          // initializes mermaid with securityLevel "strict", which sanitizes
-          // mermaid's own SVG output (confirmed by inspecting a rendered SVG
-          // from malicious input: an injected <script> was stripped
-          // outright). It does not disable HTML labels — those still render
-          // as real HTML inside <foreignObject>.
+          // Safe against untrusted diagram text — mermaid sanitizes its own
+          // SVG output at `securityLevel: "strict"`; see mermaidRenderer.ts.
           dangerouslySetInnerHTML={{ __html: view.svg }}
         />
       ) : view._tag === "Failed" ? (
