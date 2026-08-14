@@ -1,5 +1,22 @@
 import { useEffect, useState } from "react";
 
+const SCROLL_OVERFLOW = new Set(["auto", "scroll", "overlay"]);
+
+// The chat timeline scrolls inside a LegendList element, not the window, and
+// an intermediate scrolling ancestor clips a target's rect before it's
+// intersected with the root's — cancelling `rootMargin` unless that ancestor
+// is the observer's own root.
+function findScrollRoot(node: Element): Element | undefined {
+  let ancestor = node.parentElement;
+  while (ancestor !== null) {
+    if (SCROLL_OVERFLOW.has(getComputedStyle(ancestor).overflowY)) {
+      return ancestor;
+    }
+    ancestor = ancestor.parentElement;
+  }
+  return undefined;
+}
+
 /**
  * Sticky "has this node ever come near the viewport" signal, expanded by
  * `rootMargin` so a caller can start expensive work slightly before the node
@@ -25,13 +42,14 @@ export function useNearViewport(
     if (nearViewport || node === null) {
       return;
     }
+    const root = findScrollRoot(node);
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
           setNearViewport(true);
         }
       },
-      { rootMargin },
+      { rootMargin, ...(root !== undefined ? { root } : {}) },
     );
     observer.observe(node);
     return () => observer.disconnect();
