@@ -1,3 +1,5 @@
+// Extracted from ChatMarkdown.tsx: MermaidBlock needs this, and ChatMarkdown
+// imports MermaidBlock, so keeping it in ChatMarkdown.tsx would be a cycle.
 import { CheckIcon, CodeIcon, CopyIcon, WorkflowIcon, WrapTextIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
@@ -16,8 +18,17 @@ export function readInitialWordWrapSetting(): boolean {
 
 /** Shared by every markdown chrome action (copy, table export, file-link
  * open, ...) so a failure always logs under one greppable prefix. */
-export function reportMarkdownActionFailure<T extends Record<string, unknown>>(
-  context: T,
+export interface MarkdownActionFailureContext {
+  readonly operation: string;
+  readonly target?: string;
+  readonly format?: "markdown" | "csv";
+  readonly language?: string;
+  readonly fenceTitle?: string;
+  readonly copyTarget?: string;
+}
+
+export function reportMarkdownActionFailure(
+  context: MarkdownActionFailureContext,
   cause: unknown,
 ): void {
   console.error("[chat-markdown] action failed", context, cause);
