@@ -1,5 +1,3 @@
-// Extracted from ChatMarkdown.tsx: MermaidBlock needs this, and ChatMarkdown
-// imports MermaidBlock, so keeping it in ChatMarkdown.tsx would be a cycle.
 import { CheckIcon, CodeIcon, CopyIcon, WorkflowIcon, WrapTextIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
