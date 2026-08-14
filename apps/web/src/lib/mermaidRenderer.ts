@@ -4,6 +4,8 @@ import {
   mermaidFailureMessage,
   type MermaidRenderState,
 } from "../components/chat/mermaidBlock.logic";
+import { fnv1a32 } from "./diffRendering";
+import { LRUCache } from "./lruCache";
 
 /**
  * Mermaid bundles its own layout engines and is large, so it is fetched at
@@ -71,37 +73,57 @@ type MermaidRenderResult = Extract<MermaidRenderState, { status: "rendered" | "f
  * `getCachedMermaidRender` lets `MermaidBlock` seed its state from an
  * already-known result instead of flashing back to pending.
  *
- * Unbounded by design; a bounded LRU is meant to replace it later, so keep
- * this simple enough to delete outright when that lands.
+ * Sized well past a realistic thread (a demo thread holds 20 diagrams) so
+ * that streaming remounts, not genuine memory pressure, stay the only thing
+ * that ever misses this cache. A single diagram whose estimated size clears
+ * `MAX_MERMAID_CACHE_MEMORY_BYTES` is silently not stored (see
+ * `estimateMermaidRenderSize`); not considered reachable for a mermaid
+ * diagram in practice.
  */
-const renderCache = new Map<string, MermaidRenderResult>();
+const MAX_MERMAID_CACHE_ENTRIES = 200;
+const MAX_MERMAID_CACHE_MEMORY_BYTES = 20 * 1024 * 1024;
 
-function mermaidRenderCacheKey(source: string, theme: "light" | "dark"): string {
-  return `${theme}\0${source}`;
+const mermaidSvgCache = new LRUCache<MermaidRenderResult>(
+  MAX_MERMAID_CACHE_ENTRIES,
+  MAX_MERMAID_CACHE_MEMORY_BYTES,
+);
+
+/** Mirrors `estimateHighlightedSize` in `ChatMarkdown.tsx`: a rough byte
+ * count from string length, doubled/tripled to account for UTF-16 storage
+ * and object overhead, not a precise measurement. */
+function estimateMermaidRenderSize(result: MermaidRenderResult, source: string): number {
+  const payload = result.status === "rendered" ? result.svg : result.message;
+  return Math.max(payload.length * 2, source.length * 3);
+}
+
+export function mermaidRenderCacheKey(source: string, theme: "light" | "dark"): string {
+  return `${fnv1a32(source).toString(36)}:${source.length}:${theme}`;
 }
 
 /** Synchronous cache lookup, for seeding a component's initial render state
- * without waiting on the async `renderMermaidDiagram` path. */
+ * without waiting on the async `renderMermaidDiagram` path. `LRUCache.get`
+ * returns `null` on a miss; converted to `undefined` here so this keeps its
+ * original, already-adopted contract. */
 export function getCachedMermaidRender(
   source: string,
   theme: "light" | "dark",
 ): MermaidRenderResult | undefined {
-  return renderCache.get(mermaidRenderCacheKey(source, theme));
+  return mermaidSvgCache.get(mermaidRenderCacheKey(source, theme)) ?? undefined;
 }
 
 /**
- * `renderCache` only helps once a render has settled, not during the window
- * a first render for a given `(source, theme)` is still in flight — and that
- * window is not short, since it awaits `loadMermaidModule()`'s ~670 kB
- * import. Every token that streams in during that window remounts
- * `MermaidBlock`, missing `renderCache` and calling `renderMermaidDiagram`
+ * `mermaidSvgCache` only helps once a render has settled, not during the
+ * window a first render for a given `(source, theme)` is still in flight —
+ * and that window is not short, since it awaits `loadMermaidModule()`'s
+ * ~670 kB import. Every token that streams in during that window remounts
+ * `MermaidBlock`, missing `mermaidSvgCache` and calling `renderMermaidDiagram`
  * again; without this map, that would mean dozens of concurrent parse+render
  * calls for the same input.
  *
- * Keyed the same way as `renderCache` and always evicted once the promise
- * settles: on success the result already lives in `renderCache`, and on
- * rejection (loader failure or a `render()` throw) evicting is what keeps
- * the failure retryable instead of replaying it forever.
+ * Keyed the same way as `mermaidSvgCache` and always evicted once the
+ * promise settles: on success the result already lives in `mermaidSvgCache`,
+ * and on rejection (loader failure or a `render()` throw) evicting is what
+ * keeps the failure retryable instead of replaying it forever.
  */
 const inFlightRenders = new Map<string, Promise<MermaidRenderResult>>();
 
@@ -116,13 +138,13 @@ async function renderMermaidDiagramUncached(
     await mermaid.parse(source);
   } catch (error) {
     const result: MermaidRenderResult = { status: "failed", message: mermaidFailureMessage(error) };
-    renderCache.set(key, result);
+    mermaidSvgCache.set(key, result, estimateMermaidRenderSize(result, source));
     return result;
   }
   const id = `mermaid-diagram-${renderIdCounter++}`;
   const { svg } = await mermaid.render(id, source);
   const result: MermaidRenderResult = { status: "rendered", svg };
-  renderCache.set(key, result);
+  mermaidSvgCache.set(key, result, estimateMermaidRenderSize(result, source));
   return result;
 }
 
@@ -144,7 +166,7 @@ export function renderMermaidDiagram(
   theme: "light" | "dark",
 ): Promise<MermaidRenderResult> {
   const key = mermaidRenderCacheKey(source, theme);
-  const cached = renderCache.get(key);
+  const cached = mermaidSvgCache.get(key);
   if (cached) {
     return Promise.resolve(cached);
   }

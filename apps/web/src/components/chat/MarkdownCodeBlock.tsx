@@ -1,5 +1,5 @@
 import { CheckIcon, CodeIcon, CopyIcon, WorkflowIcon, WrapTextIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 
 import { getClientSettings } from "../../hooks/useSettings";
 import {
@@ -88,6 +88,7 @@ export function MarkdownCodeBlock({
   theme,
   mermaidToggle,
   children,
+  ref,
 }: {
   code: string;
   language: string;
@@ -95,6 +96,11 @@ export function MarkdownCodeBlock({
   theme: "light" | "dark";
   mermaidToggle?: MarkdownCodeBlockMermaidToggle;
   children: ReactNode;
+  /** Lets a caller (the mermaid block) observe this block's own root node
+   * rather than wrapping it in another element — this div is already a
+   * stable box present across every mermaid view branch, and React 19
+   * function components accept `ref` as a plain prop. */
+  ref?: Ref<HTMLDivElement>;
 }) {
   const [copied, setCopied] = useState(false);
   const [wrapped, setWrapped] = useState(readInitialWordWrapSetting);
@@ -143,6 +149,7 @@ export function MarkdownCodeBlock({
 
   return (
     <div
+      ref={ref}
       className="chat-markdown-codeblock border border-border/70 bg-secondary leading-snug dark:border-transparent dark:bg-input/32"
       data-language={language}
       data-wrap={wrapped ? "true" : "false"}
