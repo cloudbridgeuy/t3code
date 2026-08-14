@@ -1,5 +1,10 @@
 import type { Mermaid } from "mermaid";
 
+import {
+  mermaidFailureMessage,
+  type MermaidRenderState,
+} from "../components/chat/mermaidBlock.logic";
+
 /**
  * Mermaid bundles its own layout engines and is large, so it is fetched at
  * most once, lazily, on the first diagram — mirroring the highlighter cache
@@ -38,9 +43,12 @@ function ensureInitialized(mermaid: Mermaid, theme: "light" | "dark"): void {
   }
   mermaid.initialize({
     startOnLoad: false,
-    // Strict mode disables HTML labels and sanitizes mermaid's own SVG
-    // output, which is what makes injecting that output via
-    // dangerouslySetInnerHTML safe for untrusted agent-authored diagram text.
+    // Strict mode sanitizes mermaid's own SVG output — a real rendered SVG
+    // was inspected and confirmed an injected <script> element was stripped
+    // outright — which is what makes injecting that output via
+    // dangerouslySetInnerHTML safe for untrusted agent-authored diagram
+    // text. It does not disable HTML labels: those still render as real
+    // HTML (<div>/<p>) inside <foreignObject>.
     securityLevel: "strict",
     theme: mermaidThemeFor(theme),
   });
@@ -49,18 +57,109 @@ function ensureInitialized(mermaid: Mermaid, theme: "light" | "dark"): void {
 
 let renderIdCounter = 0;
 
-/** Loads mermaid, initializes it for `theme`, and renders `source` to SVG
- * markup. Throws (never resolves to an error value) on invalid diagram text
- * or a load failure — callers that need to isolate that from the rest of the
- * page should catch it or wrap the caller in a React error boundary. */
-export async function renderMermaidDiagram(
+type MermaidRenderResult = Extract<MermaidRenderState, { status: "rendered" | "failed" }>;
+
+/**
+ * Memoizes `renderMermaidDiagram` by its two inputs — mermaid's `render()`
+ * is a pure function of diagram source and theme, so the same pair always
+ * produces the same SVG (or the same failure).
+ *
+ * This exists because `ChatMarkdown`'s `markdownComponents` memo depends on
+ * `text`, which grows with every streamed token: that gives the `pre`
+ * override a new function identity per token, and React remounts
+ * `MermaidBlock` at that position on every remaining token once the fence
+ * has closed. Without this cache, every one of those remounts would redo a
+ * full mermaid parse+render. `getCachedMermaidRender` lets `MermaidBlock`
+ * seed its state from an already-known result so a remount reads the cache
+ * instead of flashing back to pending.
+ *
+ * Unbounded by design — V3 replaces this with a bounded LRU. Keep this
+ * simple enough to delete outright when that lands.
+ */
+const renderCache = new Map<string, MermaidRenderResult>();
+
+function mermaidRenderCacheKey(source: string, theme: "light" | "dark"): string {
+  return `${theme}\0${source}`;
+}
+
+/** Synchronous cache lookup, for seeding a component's initial render state
+ * without waiting on the async `renderMermaidDiagram` path. */
+export function getCachedMermaidRender(
   source: string,
   theme: "light" | "dark",
-): Promise<string> {
+): MermaidRenderResult | undefined {
+  return renderCache.get(mermaidRenderCacheKey(source, theme));
+}
+
+/**
+ * `renderCache` above only helps once a render has *settled* — it does
+ * nothing for the window while the first render for a given `(source,
+ * theme)` is still in flight. And that window is not short: it awaits
+ * `loadMermaidModule()`, a ~670 kB import on the first diagram in a session.
+ * Every token that streams in during that time remounts `MermaidBlock`
+ * (see its class comment), missing `renderCache` and calling
+ * `renderMermaidDiagram` again — without this, that would mean dozens of
+ * concurrent `parse`+`render` calls for the exact same input.
+ *
+ * Mirrors `loadMermaidModule` above: cache the in-flight promise, not the
+ * resolved value, keyed the same way as `renderCache`, and always evict it
+ * once the promise settles — on success the result already lives in
+ * `renderCache` so there's nothing left to reuse here, and on rejection
+ * (loader failure or a `render()` throw) evicting is what keeps the failure
+ * retryable instead of replaying it forever.
+ */
+const inFlightRenders = new Map<string, Promise<MermaidRenderResult>>();
+
+async function renderMermaidDiagramUncached(
+  key: string,
+  source: string,
+  theme: "light" | "dark",
+): Promise<MermaidRenderResult> {
   const mermaid = await loadMermaidModule();
   ensureInitialized(mermaid, theme);
-  await mermaid.parse(source);
+  try {
+    await mermaid.parse(source);
+  } catch (error) {
+    const result: MermaidRenderResult = { status: "failed", message: mermaidFailureMessage(error) };
+    renderCache.set(key, result);
+    return result;
+  }
   const id = `mermaid-diagram-${renderIdCounter++}`;
   const { svg } = await mermaid.render(id, source);
-  return svg;
+  const result: MermaidRenderResult = { status: "rendered", svg };
+  renderCache.set(key, result);
+  return result;
+}
+
+/** Loads mermaid, initializes it for `theme`, and renders `source` to SVG
+ * markup. Invalid diagram text is a normal outcome for agent-authored
+ * streaming content, not an exception, so a `parse()` rejection comes back
+ * as a `"failed"` value instead of propagating. A genuine loader or render
+ * failure (bad chunk, offline, an error `parse()` didn't catch) is a
+ * different thing and still throws — callers that need to isolate that from
+ * the rest of the page should catch it or wrap the caller in a React error
+ * boundary.
+ *
+ * Repeat calls for the same `source`/`theme` return the cached result
+ * (including a cached failure) without re-parsing or re-rendering, and
+ * concurrent calls before the first one has settled share the same in-flight
+ * render instead of each starting their own — see `inFlightRenders` above. */
+export function renderMermaidDiagram(
+  source: string,
+  theme: "light" | "dark",
+): Promise<MermaidRenderResult> {
+  const key = mermaidRenderCacheKey(source, theme);
+  const cached = renderCache.get(key);
+  if (cached) {
+    return Promise.resolve(cached);
+  }
+  const inFlight = inFlightRenders.get(key);
+  if (inFlight) {
+    return inFlight;
+  }
+  const promise = renderMermaidDiagramUncached(key, source, theme).finally(() => {
+    inFlightRenders.delete(key);
+  });
+  inFlightRenders.set(key, promise);
+  return promise;
 }
