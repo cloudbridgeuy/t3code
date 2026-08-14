@@ -849,6 +849,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           decision: input.decision,
         });
       }).pipe(
+        threadMutationSemaphore.withPermit(input.threadId),
         withMetrics({
           counter: providerTurnsTotal,
           outcomeAttributes: () =>
@@ -884,6 +885,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       yield* routed.adapter.respondToUserInput(routed.threadId, input.requestId, input.answers);
     }).pipe(
+      threadMutationSemaphore.withPermit(input.threadId),
       withMetrics({
         counter: providerTurnsTotal,
         outcomeAttributes: () =>

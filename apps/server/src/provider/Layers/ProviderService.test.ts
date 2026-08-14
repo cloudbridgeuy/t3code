@@ -1231,6 +1231,69 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("serializes pending-request responses with a concurrent rewind", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-rewind-response-race");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+      const rewindEntered = yield* Deferred.make<void>();
+      const allowRewind = yield* Deferred.make<void>();
+      const rewindImplementation = routing.codex.rewindThread.getMockImplementation();
+      assert.isDefined(rewindImplementation);
+      routing.codex.rewindThread.mockImplementationOnce((routedThreadId, lastTurnId) =>
+        Deferred.succeed(rewindEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowRewind)),
+          Effect.andThen(rewindImplementation(routedThreadId, lastTurnId)),
+        ),
+      );
+      routing.codex.respondToRequest.mockClear();
+      routing.codex.respondToUserInput.mockClear();
+
+      const rewindFiber = yield* provider.rewindConversation({ threadId }).pipe(Effect.forkChild);
+      yield* Deferred.await(rewindEntered);
+      const approvalFiber = yield* provider
+        .respondToRequest({
+          threadId,
+          requestId: asRequestId("request-during-rewind"),
+          decision: "accept",
+        })
+        .pipe(Effect.forkChild);
+      const userInputFiber = yield* provider
+        .respondToUserInput({
+          threadId,
+          requestId: asRequestId("user-input-during-rewind"),
+          answers: { answer: "accepted" },
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(routing.codex.respondToRequest.mock.calls.length, 0);
+      assert.equal(routing.codex.respondToUserInput.mock.calls.length, 0);
+
+      yield* Deferred.succeed(allowRewind, undefined);
+      yield* Fiber.join(rewindFiber);
+      yield* Fiber.join(approvalFiber);
+      yield* Fiber.join(userInputFiber);
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.deepEqual(binding?.resumeCursor, {
+        threadId: `replacement-${String(threadId)}`,
+      });
+      assert.deepEqual(routing.codex.respondToRequest.mock.calls, [
+        [threadId, asRequestId("request-during-rewind"), "accept"],
+      ]);
+      assert.deepEqual(routing.codex.respondToUserInput.mock.calls, [
+        [threadId, asRequestId("user-input-during-rewind"), { answer: "accepted" }],
+      ]);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
   it.effect("serializes rollback with a concurrent rewind", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
