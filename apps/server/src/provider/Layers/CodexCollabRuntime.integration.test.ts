@@ -14,8 +14,12 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { ThreadId } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { assert, describe } from "vite-plus/test";
 
@@ -292,6 +296,179 @@ describe("CodexSessionRuntime collab integration", () => {
       });
 
       yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("stopping the source runtime terminates old work and pending requests", () =>
+    Effect.gen(function* () {
+      const captured = wireFixture.notifications;
+      const childRegistration = captured.find((entry) => {
+        const item = (entry.params as { item?: { type?: string; agentThreadId?: string } }).item;
+        return item?.type === "subAgentActivity" && item.agentThreadId === CHILD_A;
+      });
+      const childTurnStarted = captured.find(
+        (entry) =>
+          entry.method === "turn/started" &&
+          (entry.params as { threadId?: string }).threadId === CHILD_A,
+      );
+      assert.isDefined(childRegistration);
+      assert.isDefined(childTurnStarted);
+      const runShutdownCase = (request: "approval" | "structured-input") =>
+        Effect.gen(function* () {
+          const lifecyclePath = `${scriptPath}.shutdown-lifecycle.${request}`;
+          const requestId = `shutdown-${request}-request`;
+          const requestMethod =
+            request === "approval"
+              ? "item/commandExecution/requestApproval"
+              : "item/tool/requestUserInput";
+          const expectedResult = request === "approval" ? { decision: "cancel" } : { answers: {} };
+          const script = {
+            rootThreadId: ROOT,
+            holdTurnOpen: true,
+            notifications: [childRegistration, childTurnStarted],
+            pendingRequestControl:
+              request === "approval"
+                ? { approvalRequestId: requestId }
+                : { structuredInputRequestId: requestId },
+            processCloseControl: { sidecarPath: lifecyclePath },
+          };
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+          NodeFS.rmSync(lifecyclePath, { force: true });
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              NodeFS.rmSync(scriptPath, { force: true });
+              NodeFS.rmSync(lifecyclePath, { force: true });
+            }),
+          );
+
+          const runtimeScope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(runtimeScope, Exit.void));
+          const runtime = yield* makeCodexSessionRuntime({
+            threadId: ThreadId.make(`thread-codex-source-shutdown-${request}`),
+            binaryPath: peerPath,
+            cwd: "/tmp",
+            runtimeMode: "full-access",
+            environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+          }).pipe(Effect.provideService(Scope.Scope, runtimeScope));
+          yield* Effect.addFinalizer(() => runtime.close);
+
+          const requestReady = yield* Deferred.make<void>();
+          const childTurnReady = yield* Deferred.make<void>();
+          const eventsFiber = yield* runtime.events.pipe(
+            Stream.tap((event) => {
+              if (event.method === requestMethod) {
+                return Deferred.succeed(requestReady, undefined).pipe(Effect.ignore);
+              }
+              if (
+                event.method === "collabAgent/turnStarted" &&
+                (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_A
+              ) {
+                return Deferred.succeed(childTurnReady, undefined).pipe(Effect.ignore);
+              }
+              return Effect.void;
+            }),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+
+          yield* runtime.start();
+          const rootTurn = yield* runtime.sendTurn({ input: "keep the old source working" });
+          yield* Effect.all([Deferred.await(requestReady), Deferred.await(childTurnReady)]);
+
+          const closeStartedAt = yield* Clock.currentTimeMillis;
+          yield* runtime.close;
+          const closeElapsedMs = (yield* Clock.currentTimeMillis) - closeStartedAt;
+
+          const eventsExit = yield* Fiber.await(eventsFiber);
+          assert.isTrue(
+            Exit.hasInterrupts(eventsExit),
+            "closing the runtime must terminate its old event transport",
+          );
+
+          const lifecycle = NodeFS.readFileSync(lifecyclePath, "utf8")
+            .trim()
+            .split("\n")
+            .map(
+              (line) =>
+                JSON.parse(line) as {
+                  type?: string;
+                  request?: string;
+                  result?: unknown;
+                  kind?: string;
+                  detail?: string;
+                  code?: number;
+                  pendingRequestResponses?: Readonly<Record<string, unknown>>;
+                  liveTurns?: ReadonlyArray<{
+                    readonly threadId?: string;
+                    readonly turnId?: string;
+                  }>;
+                },
+            );
+          assert.deepInclude(lifecycle, { type: "request-sent", request });
+
+          const processClose = lifecycle.find(
+            (entry) =>
+              entry.type === "process-close" &&
+              entry.kind === "signal" &&
+              entry.detail === "SIGTERM",
+          );
+          assert.isDefined(processClose, "the old app-server process must record termination");
+          assert.deepInclude(
+            processClose,
+            { type: "process-close", kind: "signal", detail: "SIGTERM" },
+            "the old app-server process must observe process termination",
+          );
+          const processExit = lifecycle.find((entry) => entry.type === "process-exit");
+          assert.deepInclude(
+            processExit,
+            { type: "process-exit", code: 0 },
+            "the old app-server process must exit before close completes",
+          );
+
+          const responseReceipt = lifecycle.find(
+            (entry) => entry.type === "response-received" && entry.request === request,
+          );
+          if (responseReceipt) {
+            assert.deepEqual(responseReceipt.result, expectedResult);
+          } else {
+            assert.equal(
+              processExit?.pendingRequestResponses?.[requestId],
+              "pending",
+              "transport close must terminate a request whose response was not flushed",
+            );
+          }
+          assert.deepInclude(
+            processExit?.liveTurns ?? [],
+            { threadId: ROOT, turnId: rootTurn.turnId },
+            "process exit must terminate the old live root turn",
+          );
+          assert.deepInclude(
+            processExit?.liveTurns ?? [],
+            {
+              threadId: CHILD_A,
+              turnId: (childTurnStarted.params as { turn: { id: string } }).turn.id,
+            },
+            "process exit must terminate the old live child turn",
+          );
+          assert.strictEqual(
+            lifecycle.at(-1),
+            processExit,
+            "the append-only lifecycle must end at process exit with no old work afterward",
+          );
+          return {
+            closeElapsedMs,
+            pendingTermination: responseReceipt ? "response" : "transport-close",
+          } as const;
+        }).pipe(Effect.scoped);
+
+      const approvalCloseMs = yield* runShutdownCase("approval");
+      const structuredInputCloseMs = yield* runShutdownCase("structured-input");
+      yield* Effect.sync(() =>
+        process.stdout.write(
+          `Codex source-close lifecycle: approval=${approvalCloseMs.closeElapsedMs} ms/${approvalCloseMs.pendingTermination}, structured-input=${structuredInputCloseMs.closeElapsedMs} ms/${structuredInputCloseMs.pendingTermination}\n`,
+        ),
+      );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
