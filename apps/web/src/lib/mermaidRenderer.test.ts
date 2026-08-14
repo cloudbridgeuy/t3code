@@ -134,4 +134,40 @@ describe("renderMermaidDiagram caching", () => {
     expect(parse).toHaveBeenCalledTimes(2);
     expect(render).toHaveBeenCalledTimes(2);
   });
+
+  it("a cache hit renders no second time — getCachedMermaidRender matches renderMermaidDiagram's settled result", async () => {
+    const { getCachedMermaidRender, renderMermaidDiagram } = await import("./mermaidRenderer");
+    const source = uniqueSource();
+
+    await renderMermaidDiagram(source, "light");
+    const cached = getCachedMermaidRender(source, "light");
+    const second = await renderMermaidDiagram(source, "light");
+
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(cached).toBe(second);
+  });
+});
+
+describe("mermaidRenderCacheKey", () => {
+  it("produces the same key for the same source and theme", async () => {
+    const { mermaidRenderCacheKey } = await import("./mermaidRenderer");
+    const source = uniqueSource();
+
+    expect(mermaidRenderCacheKey(source, "light")).toBe(mermaidRenderCacheKey(source, "light"));
+  });
+
+  it("produces a different key when only the theme changes", async () => {
+    const { mermaidRenderCacheKey } = await import("./mermaidRenderer");
+    const source = uniqueSource();
+
+    expect(mermaidRenderCacheKey(source, "light")).not.toBe(mermaidRenderCacheKey(source, "dark"));
+  });
+
+  it("produces a different key for different sources", async () => {
+    const { mermaidRenderCacheKey } = await import("./mermaidRenderer");
+
+    expect(mermaidRenderCacheKey(uniqueSource(), "light")).not.toBe(
+      mermaidRenderCacheKey(uniqueSource(), "light"),
+    );
+  });
 });

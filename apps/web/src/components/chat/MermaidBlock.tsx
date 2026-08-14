@@ -1,6 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 
-import { getCachedMermaidRender, renderMermaidDiagram } from "../../lib/mermaidRenderer";
+import { useNearViewport } from "../../hooks/useNearViewport";
+import {
+  getCachedMermaidRender,
+  mermaidRenderCacheKey,
+  renderMermaidDiagram,
+} from "../../lib/mermaidRenderer";
 import {
   hasMermaidDiagramToggle,
   mermaidFailureMessage,
@@ -8,6 +13,18 @@ import {
   type MermaidRenderState,
 } from "./mermaidBlock.logic";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
+
+// Renders the swap from code block to diagram slightly before the block is
+// on screen, so the height change it causes never reflows a visible timeline.
+const NEAR_VIEWPORT_ROOT_MARGIN = "400px";
+
+// `MermaidBlock` remounts on every streamed token once its fence has closed
+// (see mermaidRenderer.ts), re-arming `useNearViewport`'s observer from
+// scratch each time. A fast stream can retire a remount before the
+// observer's first notification lands. Remembering a key here once any
+// instance for it does observe an intersection lets a later remount seed
+// `nearViewport` as already-true instead of re-racing that observer.
+const seenNearViewport = new Set<string>();
 
 /**
  * A mermaid fence, in one of two modes: the drawn diagram, or `sourceView`
@@ -45,17 +62,34 @@ export function MermaidBlock({
       (fenceClosed ? getCachedMermaidRender(source, theme) : undefined) ?? { status: "pending" },
   );
 
+  // State, not a ref, so this effect re-runs once the node mounts — a ref
+  // read here could run before the node exists and never arm the observer.
+  const [viewportNode, setViewportNode] = useState<HTMLDivElement | null>(null);
+  const cacheKey = mermaidRenderCacheKey(source, theme);
+  const nearViewport = useNearViewport(
+    viewportNode,
+    NEAR_VIEWPORT_ROOT_MARGIN,
+    seenNearViewport.has(cacheKey),
+  );
+
   useEffect(() => {
     if (!fenceClosed) {
       return;
     }
-    // Reusing the cached result here, instead of resetting to pending
-    // first, is what prevents the flash: `setRenderState` with the same
-    // object `getCachedMermaidRender` already seeded as initial state is a
-    // no-op render (React bails via Object.is on the unchanged reference).
+    if (nearViewport) {
+      seenNearViewport.add(cacheKey);
+    }
+    // Reusing the cached result (rather than resetting to pending first) is
+    // what prevents the flash: the same object reference is a no-op
+    // setState. Left ungated by `nearViewport` — an on-screen diagram must
+    // not flash back to pending just because this remount's observer
+    // hasn't reported in yet.
     const cached = getCachedMermaidRender(source, theme);
     if (cached) {
       setRenderState(cached);
+      return;
+    }
+    if (!nearViewport) {
       return;
     }
     let cancelled = false;
@@ -74,7 +108,7 @@ export function MermaidBlock({
     return () => {
       cancelled = true;
     };
-  }, [source, theme, fenceClosed]);
+  }, [source, theme, fenceClosed, nearViewport, cacheKey]);
 
   const view = resolveMermaidView({ prefersSource, renderState, fenceClosed });
   // `exactOptionalPropertyTypes` treats an explicit `mermaidToggle: undefined` as
@@ -91,6 +125,11 @@ export function MermaidBlock({
 
   return (
     <MarkdownCodeBlock
+      // Observed directly rather than via a wrapper element, which would
+      // sit between this and `.chat-markdown`'s `:first-child`/`:last-child`
+      // margin reset and reintroduce spacing for a message that opens or
+      // closes with a diagram.
+      ref={setViewportNode}
       code={source}
       language="mermaid"
       fenceTitle={fenceTitle}
