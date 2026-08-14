@@ -1,13 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  hasMermaidDiagramToggle,
   isFenceClosed,
   isMermaidFence,
   markdownCodeBlockActions,
-  mermaidChromeMode,
   mermaidDiagramClassName,
   mermaidFailureMessage,
+  resolveMermaidPresentation,
   resolveMermaidView,
 } from "./mermaidBlock.logic";
 
@@ -196,25 +195,6 @@ describe("isFenceClosed", () => {
   });
 });
 
-describe("hasMermaidDiagramToggle", () => {
-  it("hides the toggle while there is no diagram yet (pending)", () => {
-    expect(hasMermaidDiagramToggle({ status: "pending" })).toBe(false);
-  });
-
-  it("hides the toggle when the render failed — the source is already on screen", () => {
-    expect(hasMermaidDiagramToggle({ status: "failed", message: "boom" })).toBe(false);
-  });
-
-  it("shows the toggle once a diagram has rendered, so the user can switch to source", () => {
-    // hasMermaidDiagramToggle only looks at renderState — prefersSource is a
-    // separate axis the caller combines it with. A user who has already
-    // switched to source still needs this same control to switch back to
-    // the diagram that is known to exist, which is why the check is on
-    // renderState rather than "not currently showing source".
-    expect(hasMermaidDiagramToggle({ status: "rendered", svg: "<svg></svg>" })).toBe(true);
-  });
-});
-
 describe("mermaidDiagramClassName", () => {
   it("scales the svg down to fit in fit mode", () => {
     const className = mermaidDiagramClassName("fit");
@@ -234,29 +214,136 @@ describe("mermaidDiagramClassName", () => {
   });
 });
 
-describe("mermaidChromeMode", () => {
-  it("is diagram only for a rendered Diagram view", () => {
-    expect(mermaidChromeMode({ _tag: "Diagram", svg: "<svg></svg>" })).toBe("diagram");
+describe("markdownCodeBlockActions", () => {
+  it("keeps today's wrap-only chrome for an ordinary code block", () => {
+    expect(markdownCodeBlockActions(undefined, false)).toEqual(["wrap"]);
   });
 
-  it("is source for Source, Pending, and Failed views", () => {
-    expect(mermaidChromeMode({ _tag: "Source" })).toBe("source");
-    expect(mermaidChromeMode({ _tag: "Pending" })).toBe("source");
-    expect(mermaidChromeMode({ _tag: "Failed", message: "boom" })).toBe("source");
+  it("swaps wrap-lines for the size toggle once a diagram is actually visible", () => {
+    expect(markdownCodeBlockActions("diagram", true)).toEqual(["mermaid-size", "mermaid-toggle"]);
+  });
+
+  it("keeps wrap-lines in diagram mode while no diagram has rendered yet", () => {
+    // Diagram mode with nothing to size (still pending) keeps the toggle
+    // in place but falls back to wrap-lines instead of the size control —
+    // this is what lets the toggle stay put across a render's whole
+    // lifetime without ever offering a size control with nothing to size.
+    expect(markdownCodeBlockActions("diagram", false)).toEqual(["wrap", "mermaid-toggle"]);
+  });
+
+  it("keeps wrap-lines and adds the diagram toggle in source mode, even with a diagram ready", () => {
+    // Source mode never shows the size toggle, regardless of diagramVisible
+    // — the SVG isn't on screen, so there's nothing for it to size.
+    expect(markdownCodeBlockActions("source", false)).toEqual(["wrap", "mermaid-toggle"]);
+    expect(markdownCodeBlockActions("source", true)).toEqual(["wrap", "mermaid-toggle"]);
   });
 });
 
-describe("markdownCodeBlockActions", () => {
-  it("keeps today's wrap-only chrome for an ordinary code block", () => {
-    expect(markdownCodeBlockActions(undefined)).toEqual(["wrap"]);
+describe("resolveMermaidPresentation", () => {
+  // The behavior table this function implements, keyed by (fenceClosed,
+  // renderMermaidPreferred, renderState.status):
+  //
+  // | fenceClosed | preferred | render    | view    | chromeMode |
+  // |-------------|-----------|-----------|---------|------------|
+  // | false       | either    | any       | code    | (none)     |
+  // | true        | false     | any       | source  | source     |
+  // | true        | true      | pending   | code    | diagram    |
+  // | true        | true      | rendered  | diagram | diagram    |
+  // | true        | true      | failed    | error   | (none)     |
+
+  it("shows the code block with no chrome while the fence is still open, regardless of preference", () => {
+    const preferringDiagram = resolveMermaidPresentation({
+      renderMermaidPreferred: true,
+      renderState: { status: "rendered", svg: "<svg></svg>" },
+      fenceClosed: false,
+    });
+    expect(preferringDiagram.view).toEqual({ _tag: "Pending" });
+    expect(preferringDiagram.chromeMode).toBeUndefined();
+
+    const preferringSource = resolveMermaidPresentation({
+      renderMermaidPreferred: false,
+      renderState: { status: "pending" },
+      fenceClosed: false,
+    });
+    expect(preferringSource.view).toEqual({ _tag: "Source" });
+    expect(preferringSource.chromeMode).toBeUndefined();
   });
 
-  it("swaps wrap-lines for the size toggle in diagram mode", () => {
-    expect(markdownCodeBlockActions("diagram")).toEqual(["mermaid-size", "mermaid-toggle"]);
+  it("shows source with a source-mode toggle when the user does not prefer mermaid rendering, whatever the render's own progress", () => {
+    // Once the user prefers source, chromeMode stays "source" regardless of
+    // renderState — unlike the diagram-preferred rows below, where a failed
+    // render does drop the chrome.
+    for (const renderState of [
+      { status: "pending" as const },
+      { status: "rendered" as const, svg: "<svg>ready</svg>" },
+      { status: "failed" as const, message: "boom" },
+    ]) {
+      const result = resolveMermaidPresentation({
+        renderMermaidPreferred: false,
+        renderState,
+        fenceClosed: true,
+      });
+      expect(result.view).toEqual({ _tag: "Source" });
+      expect(result.chromeMode).toBe("source");
+    }
   });
 
-  it("keeps wrap-lines and adds the diagram toggle in source mode", () => {
-    expect(markdownCodeBlockActions("source")).toEqual(["wrap", "mermaid-toggle"]);
+  it("shows the code block with a diagram-mode toggle while a preferred render is still pending", () => {
+    // This is the row that removes the flicker: the toggle is already in
+    // "diagram" mode (label "Show source") before the SVG exists, so
+    // clicking it never has to wait on the render, and the render landing
+    // never has to swap the toggle in or out from under the user.
+    const result = resolveMermaidPresentation({
+      renderMermaidPreferred: true,
+      renderState: { status: "pending" },
+      fenceClosed: true,
+    });
+    expect(result.view).toEqual({ _tag: "Pending" });
+    expect(result.chromeMode).toBe("diagram");
+  });
+
+  it("shows the diagram with a diagram-mode toggle once a preferred render completes", () => {
+    const result = resolveMermaidPresentation({
+      renderMermaidPreferred: true,
+      renderState: { status: "rendered", svg: "<svg>done</svg>" },
+      fenceClosed: true,
+    });
+    expect(result.view).toEqual({ _tag: "Diagram", svg: "<svg>done</svg>" });
+    expect(result.chromeMode).toBe("diagram");
+  });
+
+  it("shows the error and source with no chrome once a preferred render permanently fails", () => {
+    // Unlike the pending row, a failed render has nothing left to toggle
+    // to, and never will on its own — so unlike pending, this row drops
+    // the chrome entirely rather than keeping a toggle with nothing behind
+    // it.
+    const result = resolveMermaidPresentation({
+      renderMermaidPreferred: true,
+      renderState: { status: "failed", message: "bad diagram" },
+      fenceClosed: true,
+    });
+    expect(result.view).toEqual({ _tag: "Failed", message: "bad diagram" });
+    expect(result.chromeMode).toBeUndefined();
+  });
+
+  it("inverts the stored preference into prefersSource, covering both stored values", () => {
+    // The polarity itself: `renderMermaidPreferred` is "should this render
+    // as a diagram", so `true` must read as NOT preferring source and
+    // `false` must read as preferring source. A flipped inversion here
+    // would silently break "reload keeps the chosen mode".
+    const whenPreferred = resolveMermaidPresentation({
+      renderMermaidPreferred: true,
+      renderState: { status: "pending" },
+      fenceClosed: true,
+    });
+    expect(whenPreferred.prefersSource).toBe(false);
+
+    const whenNotPreferred = resolveMermaidPresentation({
+      renderMermaidPreferred: false,
+      renderState: { status: "pending" },
+      fenceClosed: true,
+    });
+    expect(whenNotPreferred.prefersSource).toBe(true);
   });
 });
 

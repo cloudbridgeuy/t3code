@@ -6,14 +6,13 @@ import { useNearViewport } from "../../hooks/useNearViewport";
 import {
   getCachedMermaidRender,
   mermaidRenderCacheKey,
+  mermaidSourceKey,
   renderMermaidDiagram,
 } from "../../lib/mermaidRenderer";
 import {
-  hasMermaidDiagramToggle,
-  mermaidChromeMode,
   mermaidDiagramClassName,
   mermaidFailureMessage,
-  resolveMermaidView,
+  resolveMermaidPresentation,
   type MermaidRenderState,
   type MermaidSizeMode,
 } from "./mermaidBlock.logic";
@@ -34,6 +33,15 @@ const NEAR_VIEWPORT_ROOT_MARGIN = "400px";
 // instance for it does observe an intersection lets a later remount seed
 // `nearViewport` as already-true instead of re-racing that observer.
 const seenNearViewport = new Set<string>();
+
+// `sizeMode` lives here for the same remount-survival reason as
+// `seenNearViewport` above — but keyed on source alone (via
+// `mermaidSourceKey`, not `mermaidRenderCacheKey`) so switching themes
+// doesn't drop the user's chosen size. Only diagrams currently expanded to
+// natural size get an entry, deleted again once the block returns to fit, so
+// this stays bounded by how many diagrams a user has actually expanded
+// rather than growing with every diagram ever seen.
+const naturalSizeMermaidDiagrams = new Set<string>();
 
 /**
  * A mermaid fence, in one of two modes: the drawn diagram, or `sourceView`
@@ -68,8 +76,22 @@ export function MermaidBlock({
     true,
     Schema.Boolean,
   );
-  const prefersSource = !renderMermaidPreferred;
-  const [sizeMode, setSizeMode] = useState<MermaidSizeMode>("fit");
+  const sourceKey = mermaidSourceKey(source);
+  // Seeded from (and kept in sync with) `naturalSizeMermaidDiagrams` rather
+  // than always starting at "fit" — see that set's comment for why a plain
+  // `useState("fit")` here would snap an expanded diagram back to fit on the
+  // next streamed token.
+  const [sizeMode, setSizeMode] = useState<MermaidSizeMode>(() =>
+    naturalSizeMermaidDiagrams.has(sourceKey) ? "natural" : "fit",
+  );
+  const handleSizeModeChange = (nextSizeMode: MermaidSizeMode) => {
+    if (nextSizeMode === "natural") {
+      naturalSizeMermaidDiagrams.add(sourceKey);
+    } else {
+      naturalSizeMermaidDiagrams.delete(sourceKey);
+    }
+    setSizeMode(nextSizeMode);
+  };
   const [renderState, setRenderState] = useState<MermaidRenderState>(
     () =>
       (fenceClosed ? getCachedMermaidRender(source, theme) : undefined) ?? { status: "pending" },
@@ -84,6 +106,11 @@ export function MermaidBlock({
     NEAR_VIEWPORT_ROOT_MARGIN,
     seenNearViewport.has(cacheKey),
   );
+  const { view, prefersSource, chromeMode } = resolveMermaidPresentation({
+    renderMermaidPreferred,
+    renderState,
+    fenceClosed,
+  });
 
   useEffect(() => {
     if (!fenceClosed) {
@@ -105,6 +132,13 @@ export function MermaidBlock({
     if (!nearViewport) {
       return;
     }
+    if (prefersSource) {
+      // The cache read above still runs — a cached SVG is free and makes
+      // toggling back to diagram instant — but a user who prefers source
+      // gets no `import("mermaid")` and no render for a diagram they've said
+      // they don't want to see.
+      return;
+    }
     let cancelled = false;
     setRenderState({ status: "pending" });
     renderMermaidDiagram(source, theme)
@@ -121,19 +155,19 @@ export function MermaidBlock({
     return () => {
       cancelled = true;
     };
-  }, [source, theme, fenceClosed, nearViewport, cacheKey]);
+  }, [source, theme, fenceClosed, nearViewport, cacheKey, prefersSource]);
 
-  const view = resolveMermaidView({ prefersSource, renderState, fenceClosed });
   // `exactOptionalPropertyTypes` treats an explicit `mermaid: undefined` as
   // different from the prop being absent, so the chrome is spread in rather
-  // than passed as `undefined` when there is no diagram yet to toggle to.
-  const mermaidChromeProps = hasMermaidDiagramToggle(renderState)
+  // than passed as `undefined` when there is no chrome to show.
+  const mermaidChromeProps = chromeMode
     ? {
         mermaid: {
-          mode: mermaidChromeMode(view),
+          mode: chromeMode,
+          diagramVisible: view._tag === "Diagram",
           onToggleMode: () => setRenderMermaidPreferred((v) => !v),
           sizeMode,
-          onSizeModeChange: setSizeMode,
+          onSizeModeChange: handleSizeModeChange,
         },
       }
     : {};

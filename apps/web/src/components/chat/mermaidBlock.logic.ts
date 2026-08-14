@@ -117,24 +117,6 @@ export function resolveMermaidView(input: {
   }
 }
 
-/**
- * Whether the header's source/diagram toggle should render at all.
- *
- * The toggle is only honest once a diagram actually exists to switch
- * to — `renderState.status === "rendered"` covers both directions: while
- * `prefersSource` is false it offers the way to source, and once the user
- * has switched to source (`prefersSource` true) it still offers the way
- * back, because `renderState` does not change when the user's preference
- * does. Before a diagram exists — fence still open, still pending, or the
- * render failed — there is nothing to toggle to, so the control does not
- * appear; an open fence, a pending render, and a failed render all already
- * fall through to the code block (or the code block plus an error message)
- * on their own.
- */
-export function hasMermaidDiagramToggle(renderState: MermaidRenderState): boolean {
-  return renderState.status === "rendered";
-}
-
 /** `fit` scales the SVG down to the panel width (today's default); `natural`
  * shows it at its own width and leans on the container's `overflow-x-auto`
  * for horizontal scroll instead. */
@@ -149,34 +131,72 @@ export function mermaidDiagramClassName(sizeMode: MermaidSizeMode): string {
     : `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-none`;
 }
 
-/** Which of the two chrome layouts a mermaid block's header should show.
- * Only an actual `Diagram` view gets the diagram chrome (fit/natural sizing,
- * no wrap-lines); `Source`, `Pending`, and `Failed` all render the same
- * source-shaped code block underneath, so they share the source chrome. */
+/** Which of the two chrome layouts a mermaid block's header should show —
+ * "diagram" while the user wants to see one (whether or not it has rendered
+ * yet), "source" once they have switched away from it. Unlike `MermaidView`,
+ * this tracks the user's preference rather than render progress, which is
+ * what keeps the toggle from flickering while a render is in flight; see
+ * `resolveMermaidPresentation`. */
 export type MermaidChromeMode = "diagram" | "source";
 
-export function mermaidChromeMode(view: MermaidView): MermaidChromeMode {
-  return view._tag === "Diagram" ? "diagram" : "source";
-}
-
 /** The header actions `MarkdownCodeBlock` renders before the always-present
- * copy button. A plain code block (`mermaidMode` absent — either not
- * mermaid, or mermaid with no diagram yet to toggle to) keeps today's
- * wrap-lines-only chrome. Diagram mode swaps wrap-lines (meaningless
- * against an SVG) for the fit/natural size toggle; source mode keeps
- * wrap-lines and adds the toggle back to the diagram that is known to
- * exist. */
+ * copy button, and in the order they render. No chrome mode (an ordinary
+ * code block, or a mermaid block with nothing to toggle to) keeps today's
+ * wrap-lines-only chrome. Diagram mode shows the fit/natural size toggle in
+ * place of wrap-lines, but only once `diagramVisible` — an SVG is actually
+ * on screen; a diagram-preferred block still waiting on its render has
+ * nothing to size yet, so it keeps wrap-lines like source mode does. */
 export type MarkdownCodeBlockAction = "wrap" | "mermaid-size" | "mermaid-toggle";
 
 export function markdownCodeBlockActions(
   mermaidMode: MermaidChromeMode | undefined,
+  diagramVisible: boolean,
 ): ReadonlyArray<MarkdownCodeBlockAction> {
   if (!mermaidMode) {
     return ["wrap"];
   }
-  return mermaidMode === "diagram"
+  return mermaidMode === "diagram" && diagramVisible
     ? ["mermaid-size", "mermaid-toggle"]
     : ["wrap", "mermaid-toggle"];
+}
+
+/**
+ * What a mermaid block shows, and which chrome mode its header uses, as one
+ * function of the three inputs that decide both: the persisted render
+ * preference, the render's progress, and whether the fence has closed.
+ *
+ * `renderMermaidPreferred` is the raw stored value ("should this render as a
+ * diagram"); inverting it into `prefersSource` here, rather than at the call
+ * site, is what puts that inversion under test instead of leaving it as an
+ * untested inline expression.
+ *
+ * `chromeMode` is absent (no chrome at all) only while the fence is still
+ * open — nothing has streamed in to toggle yet — or once a diagram-preferred
+ * render has permanently failed, since the failure view already shows the
+ * source with no diagram to offer switching back to. Every other case gets a
+ * `chromeMode`, including a diagram-preferred render that is still pending:
+ * the toggle stays put and only its label changes once the SVG lands,
+ * instead of appearing or disappearing out from under the user's cursor.
+ */
+export function resolveMermaidPresentation(input: {
+  readonly renderMermaidPreferred: boolean;
+  readonly renderState: MermaidRenderState;
+  readonly fenceClosed: boolean;
+}): {
+  readonly view: MermaidView;
+  readonly prefersSource: boolean;
+  readonly chromeMode?: MermaidChromeMode;
+} {
+  const prefersSource = !input.renderMermaidPreferred;
+  const view = resolveMermaidView({
+    prefersSource,
+    renderState: input.renderState,
+    fenceClosed: input.fenceClosed,
+  });
+  if (!input.fenceClosed || (!prefersSource && input.renderState.status === "failed")) {
+    return { view, prefersSource };
+  }
+  return { view, prefersSource, chromeMode: prefersSource ? "source" : "diagram" };
 }
 
 /** Pulls a human-readable message out of whatever a render rejected with.
