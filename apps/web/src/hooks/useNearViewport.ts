@@ -8,11 +8,17 @@ import { useEffect, useState } from "react";
  *
  * Degrades to `true` where `IntersectionObserver` doesn't exist (the test
  * environment has no DOM globals at all): the feature disappears, it does
- * not turn into a permanent "never render".
+ * not turn into a permanent "never render". `alreadyNear` lets a caller that
+ * remounts this node skip a fresh observer entirely when it already knows
+ * the answer from a prior mount.
  */
-export function useNearViewport(node: Element | null, rootMargin: string): boolean {
+export function useNearViewport(
+  node: Element | null,
+  rootMargin: string,
+  alreadyNear = false,
+): boolean {
   const [nearViewport, setNearViewport] = useState(
-    () => typeof IntersectionObserver === "undefined",
+    () => alreadyNear || typeof IntersectionObserver === "undefined",
   );
 
   useEffect(() => {

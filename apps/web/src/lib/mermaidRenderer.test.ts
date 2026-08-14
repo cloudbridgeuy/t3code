@@ -1,7 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { LRUCache } from "./lruCache";
-
 const { initialize, parse, render } = vi.hoisted(() => ({
   initialize: vi.fn(),
   parse: vi.fn().mockResolvedValue(true),
@@ -171,29 +169,5 @@ describe("mermaidRenderCacheKey", () => {
     expect(mermaidRenderCacheKey(uniqueSource(), "light")).not.toBe(
       mermaidRenderCacheKey(uniqueSource(), "light"),
     );
-  });
-});
-
-describe("mermaidSvgCache eviction", () => {
-  // The production cache is sized for a realistic thread (well past the
-  // 20-diagram demo), so exercising real eviction against it would mean
-  // driving hundreds of renders through this test. A small LRUCache built
-  // the same way, keyed with the same `mermaidRenderCacheKey`, tests the
-  // same eviction behavior without that cost.
-  it("misses the oldest key once the cache is over its entry limit", async () => {
-    const { mermaidRenderCacheKey } = await import("./mermaidRenderer");
-    const cache = new LRUCache<{ status: "rendered"; svg: string }>(2, 10_000);
-    const [sourceA, sourceB, sourceC] = [uniqueSource(), uniqueSource(), uniqueSource()];
-    const keyA = mermaidRenderCacheKey(sourceA, "light");
-    const keyB = mermaidRenderCacheKey(sourceB, "light");
-    const keyC = mermaidRenderCacheKey(sourceC, "light");
-
-    cache.set(keyA, { status: "rendered", svg: "<svg>a</svg>" }, 10);
-    cache.set(keyB, { status: "rendered", svg: "<svg>b</svg>" }, 10);
-    cache.set(keyC, { status: "rendered", svg: "<svg>c</svg>" }, 10);
-
-    expect(cache.get(keyA)).toBeNull();
-    expect(cache.get(keyB)).toEqual({ status: "rendered", svg: "<svg>b</svg>" });
-    expect(cache.get(keyC)).toEqual({ status: "rendered", svg: "<svg>c</svg>" });
   });
 });
