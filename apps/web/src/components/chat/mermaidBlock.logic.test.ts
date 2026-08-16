@@ -217,7 +217,18 @@ describe("mermaidDiagramClassName", () => {
     // The width comes from the custom property the caller supplies, with a
     // fallback so an unset property doesn't collapse to the SVG default
     // 300x150 replaced-element size.
-    expect(className).toContain(`[&_svg]:w-[var(${MERMAID_NATURAL_WIDTH_CSS_VAR},100%)]`);
+    expect(className).toContain("[&_svg]:w-[var(--mermaid-natural-width,100%)]");
+  });
+
+  it("keeps the literal class in sync with MERMAID_NATURAL_WIDTH_CSS_VAR", () => {
+    // The class string must spell out the custom property name literally
+    // (Tailwind never executes source, only scans it as text), while
+    // `MermaidBlock` sets that same property from the exported constant. This
+    // test is the one place allowed to interpolate the constant, so a rename
+    // of one without the other fails here instead of silently losing the
+    // Tailwind rule again.
+    const className = mermaidDiagramClassName("natural");
+    expect(className).toContain(`var(${MERMAID_NATURAL_WIDTH_CSS_VAR}`);
   });
 
   it("keeps the horizontal scroll container in both modes", () => {

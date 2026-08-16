@@ -143,9 +143,14 @@ const MERMAID_DIAGRAM_BASE_CLASS_NAME =
  * the cap mermaid computed for itself.
  */
 export function mermaidDiagramClassName(sizeMode: MermaidSizeMode): string {
-  return sizeMode === "fit"
-    ? `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-full`
-    : `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-none! [&_svg]:w-[var(${MERMAID_NATURAL_WIDTH_CSS_VAR},100%)]`;
+  if (sizeMode === "fit") {
+    return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-full`;
+  }
+  // Tailwind scans source text without executing it, so this custom property
+  // name must be written literally here, not interpolated from
+  // `MERMAID_NATURAL_WIDTH_CSS_VAR` — an interpolated class produces no rule.
+  // It appears twice on purpose: keep this copy in sync with the constant.
+  return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-none! [&_svg]:w-[var(--mermaid-natural-width,100%)]`;
 }
 
 /** How far into a rendered SVG string to look for the root `<svg>` tag's
