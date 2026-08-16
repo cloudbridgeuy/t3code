@@ -117,18 +117,70 @@ export function resolveMermaidView(input: {
   }
 }
 
-/** `fit` scales the SVG down to the panel width (today's default); `natural`
- * shows it at its own width and leans on the container's `overflow-x-auto`
- * for horizontal scroll instead. */
+/** `fit` relies on mermaid's own root `<svg width="100%">` presentation
+ * attribute — any CSS `width` beats a presentation attribute, so leaving it
+ * alone is what makes fit work today. `natural` has to override that
+ * attribute itself with an explicit CSS `width`, then leans on the
+ * container's `overflow-x-auto` for horizontal scroll instead. */
 export type MermaidSizeMode = "fit" | "natural";
+
+/** Custom property `mermaidDiagramClassName`'s natural-mode width reads
+ * from; `MermaidBlock` sets it inline from `parseMermaidNaturalWidth`. */
+export const MERMAID_NATURAL_WIDTH_CSS_VAR = "--mermaid-natural-width";
 
 const MERMAID_DIAGRAM_BASE_CLASS_NAME =
   "chat-markdown-mermaid-diagram overflow-x-auto p-3 [&_svg]:h-auto";
 
+/**
+ * `fit`: mermaid's own `width="100%"` presentation attribute already fits
+ * the diagram to its container, so this leaves the svg alone. `natural`: a
+ * CSS `width` beats that attribute, so this sets one from
+ * `MERMAID_NATURAL_WIDTH_CSS_VAR` (with a `100%` fallback, so a block whose
+ * natural width couldn't be parsed degrades to fit instead of collapsing to
+ * the SVG default replaced-element size). It also force-lifts mermaid's own
+ * inline `max-width` — being an inline style, only an `!important` rule can
+ * override it — so a wide diagram in a wide container isn't still held to
+ * the cap mermaid computed for itself.
+ */
 export function mermaidDiagramClassName(sizeMode: MermaidSizeMode): string {
   return sizeMode === "fit"
     ? `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-full`
-    : `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-none`;
+    : `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-none! [&_svg]:w-[var(${MERMAID_NATURAL_WIDTH_CSS_VAR},100%)]`;
+}
+
+/** How far into a rendered SVG string to look for the root `<svg>` tag's
+ * attributes. Real mermaid output puts them well within this, and reading
+ * only the head keeps this parser out of the business of scanning a whole
+ * (possibly large) diagram body. */
+const SVG_HEAD_LENGTH = 2048;
+
+/** Mermaid's own inline cap: `style="...max-width: 1705.03125px;..."` on the
+ * root svg. Checked first since it is already the exact pixel figure mermaid
+ * derived for this diagram. */
+const INLINE_MAX_WIDTH_PATTERN = /<svg\b[^>]*\bstyle="[^"]*max-width:\s*([0-9.]+)px/;
+
+/** Fallback source: the root svg's `viewBox="minX minY width height"`. Used
+ * when a future mermaid config drops the inline cap. */
+const VIEW_BOX_PATTERN = /<svg\b[^>]*\bviewBox="([^"]*)"/;
+
+/**
+ * The diagram's natural CSS width in pixels, read from the head of a
+ * rendered mermaid SVG string — its inline `max-width`, or failing that the
+ * third (width) value of its `viewBox`. `undefined` when neither is present,
+ * or the one found does not parse to a finite, positive number. DOM-free and
+ * string-only so it runs the same in a `node` test environment as in the
+ * browser.
+ */
+export function parseMermaidNaturalWidth(svg: string): number | undefined {
+  const head = svg.slice(0, SVG_HEAD_LENGTH);
+  const inlineMaxWidth = INLINE_MAX_WIDTH_PATTERN.exec(head)?.[1];
+  const viewBox = VIEW_BOX_PATTERN.exec(head)?.[1];
+  const raw = inlineMaxWidth ?? viewBox?.trim().split(/\s+/)[2];
+  if (raw == null) {
+    return undefined;
+  }
+  const width = Number(raw);
+  return Number.isFinite(width) && width > 0 ? width : undefined;
 }
 
 /** Which of the two chrome layouts a mermaid block's header should show —

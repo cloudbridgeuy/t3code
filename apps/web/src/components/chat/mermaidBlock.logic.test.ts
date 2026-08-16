@@ -4,8 +4,10 @@ import {
   isFenceClosed,
   isMermaidFence,
   markdownCodeBlockActions,
+  MERMAID_NATURAL_WIDTH_CSS_VAR,
   mermaidDiagramClassName,
   mermaidFailureMessage,
+  parseMermaidNaturalWidth,
   resolveMermaidPresentation,
   resolveMermaidView,
 } from "./mermaidBlock.logic";
@@ -196,21 +198,68 @@ describe("isFenceClosed", () => {
 });
 
 describe("mermaidDiagramClassName", () => {
-  it("scales the svg down to fit in fit mode", () => {
+  it('leaves the svg alone in fit mode, relying on mermaid\'s own width="100%"', () => {
+    // Fit mode must keep behaving exactly as it does today: no width lever,
+    // no forced (`!`) important cap.
     const className = mermaidDiagramClassName("fit");
     expect(className).toContain("[&_svg]:max-w-full");
     expect(className).not.toContain("max-w-none");
+    expect(className).not.toContain("width");
+    expect(className).not.toContain(MERMAID_NATURAL_WIDTH_CSS_VAR);
   });
 
-  it("leaves the svg at its own width in natural mode", () => {
+  it("sets an explicit width and force-lifts the cap in natural mode", () => {
     const className = mermaidDiagramClassName("natural");
-    expect(className).toContain("[&_svg]:max-w-none");
+    // `!important` is required to beat mermaid's own inline `max-width`
+    // style — a plain class rule cannot.
+    expect(className).toContain("[&_svg]:max-w-none!");
     expect(className).not.toContain("max-w-full");
+    // The width comes from the custom property the caller supplies, with a
+    // fallback so an unset property doesn't collapse to the SVG default
+    // 300x150 replaced-element size.
+    expect(className).toContain(`[&_svg]:w-[var(${MERMAID_NATURAL_WIDTH_CSS_VAR},100%)]`);
   });
 
   it("keeps the horizontal scroll container in both modes", () => {
     expect(mermaidDiagramClassName("fit")).toContain("overflow-x-auto");
     expect(mermaidDiagramClassName("natural")).toContain("overflow-x-auto");
+  });
+});
+
+describe("parseMermaidNaturalWidth", () => {
+  const svgHead = (attrs: string) =>
+    `<svg aria-roledescription="flowchart-v2" role="graphics-document document" ${attrs} class="flowchart" xmlns="http://www.w3.org/2000/svg"><g>...</g></svg>`;
+
+  it("reads the inline max-width, matching a real mermaid svg head", () => {
+    const svg = svgHead(
+      'viewBox="0.00000762939453125 0 1705.03125 1443.7879638671875" style="max-width: 1705.03125px;" width="100%"',
+    );
+    expect(parseMermaidNaturalWidth(svg)).toBe(1705.03125);
+  });
+
+  it("falls back to the viewBox's third value when there is no inline max-width", () => {
+    const svg = svgHead('viewBox="0 0 640.5 320.25" width="100%"');
+    expect(parseMermaidNaturalWidth(svg)).toBe(640.5);
+  });
+
+  it("returns undefined when neither an inline max-width nor a viewBox is present", () => {
+    const svg = svgHead('width="100%"');
+    expect(parseMermaidNaturalWidth(svg)).toBeUndefined();
+  });
+
+  it("returns undefined for a malformed viewBox width", () => {
+    const svg = svgHead('viewBox="0 0 abc 100" width="100%"');
+    expect(parseMermaidNaturalWidth(svg)).toBeUndefined();
+  });
+
+  it("returns undefined for a non-positive viewBox width", () => {
+    const svg = svgHead('viewBox="0 0 0 100" width="100%"');
+    expect(parseMermaidNaturalWidth(svg)).toBeUndefined();
+  });
+
+  it("returns undefined for a non-positive inline max-width", () => {
+    const svg = svgHead('style="max-width: 0px;" viewBox="0 0 500 300" width="100%"');
+    expect(parseMermaidNaturalWidth(svg)).toBeUndefined();
   });
 });
 

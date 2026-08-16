@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { useNearViewport } from "../../hooks/useNearViewport";
@@ -10,8 +10,10 @@ import {
   renderMermaidDiagram,
 } from "../../lib/mermaidRenderer";
 import {
+  MERMAID_NATURAL_WIDTH_CSS_VAR,
   mermaidDiagramClassName,
   mermaidFailureMessage,
+  parseMermaidNaturalWidth,
   resolveMermaidPresentation,
   type MermaidRenderState,
   type MermaidSizeMode,
@@ -172,6 +174,26 @@ export function MermaidBlock({
       }
     : {};
 
+  // Memoized on the SVG string alone so this doesn't re-parse on every one
+  // of this component's frequent mid-stream remounts.
+  const diagramSvg = view._tag === "Diagram" ? view.svg : undefined;
+  const naturalWidthPx = useMemo(
+    () => (diagramSvg ? parseMermaidNaturalWidth(diagramSvg) : undefined),
+    [diagramSvg],
+  );
+  // Same `exactOptionalPropertyTypes` treatment as `mermaidChromeProps`
+  // above: spread the style in rather than pass `style={undefined}` when
+  // there is nothing to set (fit mode ignores the property; natural mode
+  // falls back to it via CSS, see `mermaidDiagramClassName`).
+  const mermaidDiagramStyleProps =
+    naturalWidthPx == null
+      ? {}
+      : {
+          style: {
+            [MERMAID_NATURAL_WIDTH_CSS_VAR]: `${naturalWidthPx}px`,
+          } as CSSProperties,
+        };
+
   return (
     <MarkdownCodeBlock
       // Observed directly rather than via a wrapper element, which would
@@ -188,6 +210,7 @@ export function MermaidBlock({
       {view._tag === "Diagram" ? (
         <div
           className={mermaidDiagramClassName(sizeMode)}
+          {...mermaidDiagramStyleProps}
           // Safe against untrusted diagram text — mermaid sanitizes its own
           // SVG output at `securityLevel: "strict"`; see mermaidRenderer.ts.
           dangerouslySetInnerHTML={{ __html: view.svg }}
