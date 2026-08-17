@@ -231,11 +231,14 @@ describe("mermaidDiagramClassName", () => {
     expect(className).toContain(`var(${MERMAID_NATURAL_WIDTH_CSS_VAR}`);
   });
 
-  it("scrolls horizontally only in fit mode, and on both axes with a height cap in natural mode", () => {
+  it("caps height and scrolls in both fit and natural mode, never just horizontally", () => {
+    // A diagram keeps its aspect ratio, so a tall-relative-to-width diagram
+    // grows exactly as tall as fit's full container width demands. Both
+    // modes must cap that height and scroll rather than let the message grow.
     const fitClassName = mermaidDiagramClassName("fit");
-    expect(fitClassName).toContain("overflow-x-auto");
-    expect(fitClassName).not.toContain("overflow-auto");
-    expect(fitClassName).not.toContain("max-h-");
+    expect(fitClassName).toContain("overflow-auto");
+    expect(fitClassName).not.toContain("overflow-x-auto");
+    expect(fitClassName).toContain("max-h-[70vh]");
 
     const naturalClassName = mermaidDiagramClassName("natural");
     expect(naturalClassName).toContain("overflow-auto");

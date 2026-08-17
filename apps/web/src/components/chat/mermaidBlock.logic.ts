@@ -128,32 +128,36 @@ export type MermaidSizeMode = "fit" | "natural";
  * from; `MermaidBlock` sets it inline from `parseMermaidNaturalWidth`. */
 export const MERMAID_NATURAL_WIDTH_CSS_VAR = "--mermaid-natural-width";
 
-const MERMAID_DIAGRAM_BASE_CLASS_NAME = "chat-markdown-mermaid-diagram p-3 [&_svg]:h-auto";
+const MERMAID_DIAGRAM_BASE_CLASS_NAME =
+  "chat-markdown-mermaid-diagram p-3 [&_svg]:h-auto overflow-auto max-h-[70vh]";
 
 /**
- * `fit`: mermaid's own `width="100%"` presentation attribute already fits
- * the diagram to its container, so this leaves the svg alone and scrolls
- * horizontally only, exactly as before. `natural`: a CSS `width` beats that
- * attribute, so this sets one from `MERMAID_NATURAL_WIDTH_CSS_VAR` (with a
- * `100%` fallback, so a block whose natural width couldn't be parsed
- * degrades to fit instead of collapsing to the SVG default replaced-element
- * size). It also force-lifts mermaid's own inline `max-width` — being an
- * inline style, only an `!important` rule can override it — so a wide
- * diagram in a wide container isn't still held to the cap mermaid computed
- * for itself. Since the SVG keeps its own aspect ratio (`[&_svg]:h-auto`
- * above), a wide diagram is also a tall one, so natural mode caps the
- * container's own height and scrolls both axes instead of stretching the
- * chat message to the diagram's full height.
+ * Since the SVG keeps its own aspect ratio (`[&_svg]:h-auto` above), a
+ * diagram that is tall relative to its width grows just as tall as it is
+ * wide — so both modes cap the container's height and scroll (the shared
+ * `overflow-auto max-h-[70vh]` above) rather than stretching the chat
+ * message to the diagram's full height. `fit`: mermaid's own `width="100%"`
+ * presentation attribute already fits the diagram to the container's width,
+ * so this leaves the svg alone; capping height still leaves width covered,
+ * so the only scrollbar a fit diagram can produce is vertical. `natural`: a
+ * CSS `width` beats that attribute, so this sets one from
+ * `MERMAID_NATURAL_WIDTH_CSS_VAR` (with a `100%` fallback, so a block whose
+ * natural width couldn't be parsed degrades to fit instead of collapsing to
+ * the SVG default replaced-element size). It also force-lifts mermaid's own
+ * inline `max-width` — being an inline style, only an `!important` rule can
+ * override it — so a wide diagram in a wide container isn't still held to
+ * the cap mermaid computed for itself; that can push natural mode's own
+ * scrollbar horizontal too.
  */
 export function mermaidDiagramClassName(sizeMode: MermaidSizeMode): string {
   if (sizeMode === "fit") {
-    return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} overflow-x-auto [&_svg]:max-w-full`;
+    return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-full`;
   }
   // Tailwind scans source text without executing it, so this custom property
   // name must be written literally here, not interpolated from
   // `MERMAID_NATURAL_WIDTH_CSS_VAR` — an interpolated class produces no rule.
   // It appears twice on purpose: keep this copy in sync with the constant.
-  return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} overflow-auto max-h-[70vh] [&_svg]:max-w-none! [&_svg]:w-[var(--mermaid-natural-width,100%)]`;
+  return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} [&_svg]:max-w-none! [&_svg]:w-[var(--mermaid-natural-width,100%)]`;
 }
 
 /** How far into a rendered SVG string to look for the root `<svg>` tag's
