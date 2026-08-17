@@ -1,4 +1,12 @@
-import { CheckIcon, CodeIcon, CopyIcon, WorkflowIcon, WrapTextIcon } from "lucide-react";
+import {
+  CheckIcon,
+  CodeIcon,
+  CopyIcon,
+  ShrinkIcon,
+  UnfoldHorizontalIcon,
+  WorkflowIcon,
+  WrapTextIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 
 import { getClientSettings } from "../../hooks/useSettings";
@@ -8,6 +16,11 @@ import {
 } from "../../pierre-icons";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import {
+  markdownCodeBlockActions,
+  type MermaidChromeMode,
+  type MermaidSizeMode,
+} from "./mermaidBlock.logic";
 import { PierreEntryIcon } from "./PierreEntryIcon";
 
 export function readInitialWordWrapSetting(): boolean {
@@ -73,12 +86,18 @@ function MarkdownCodeBlockTitleContent({
   );
 }
 
-/** Toggles a mermaid block between its rendered diagram and its source —
- * owned by the mermaid block, rendered in this shared header so it sits
- * beside copy and wrap like any other code block action. */
-export interface MarkdownCodeBlockMermaidToggle {
-  readonly showingSource: boolean;
-  readonly onToggle: () => void;
+/** Owned by the mermaid block, rendered in this shared header so mermaid's
+ * actions sit beside copy like any other code block action. `mode` and
+ * `diagramVisible` together pick which actions render — see
+ * `markdownCodeBlockActions`; `onToggleMode` switches between source and
+ * diagram, `sizeMode`/`onSizeModeChange` drive the diagram-mode fit/natural
+ * control. */
+export interface MarkdownCodeBlockMermaidChrome {
+  readonly mode: MermaidChromeMode;
+  readonly diagramVisible: boolean;
+  readonly onToggleMode: () => void;
+  readonly sizeMode: MermaidSizeMode;
+  readonly onSizeModeChange: (sizeMode: MermaidSizeMode) => void;
 }
 
 export function MarkdownCodeBlock({
@@ -86,7 +105,7 @@ export function MarkdownCodeBlock({
   language,
   fenceTitle,
   theme,
-  mermaidToggle,
+  mermaid,
   children,
   ref,
 }: {
@@ -94,7 +113,7 @@ export function MarkdownCodeBlock({
   language: string;
   fenceTitle: string | null;
   theme: "light" | "dark";
-  mermaidToggle?: MarkdownCodeBlockMermaidToggle;
+  mermaid?: MarkdownCodeBlockMermaidChrome;
   children: ReactNode;
   /** Lets a caller (the mermaid block) observe this block's own root node
    * rather than wrapping it in another element — this div is already a
@@ -105,9 +124,11 @@ export function MarkdownCodeBlock({
   const [copied, setCopied] = useState(false);
   const [wrapped, setWrapped] = useState(readInitialWordWrapSetting);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const actions = markdownCodeBlockActions(mermaid?.mode, mermaid?.diagramVisible ?? false);
   const wrapLabel = wrapped ? "Disable line wrap" : "Wrap lines";
   const copyLabel = copied ? "Copied" : "Copy code";
-  const toggleLabel = mermaidToggle?.showingSource ? "Show diagram" : "Show source";
+  const toggleLabel = mermaid?.mode === "diagram" ? "Show source" : "Show diagram";
+  const sizeLabel = mermaid?.sizeMode === "natural" ? "Fit to width" : "Show natural size";
 
   const handleCopy = useCallback(() => {
     if (typeof navigator === "undefined" || navigator.clipboard == null) {
@@ -163,48 +184,85 @@ export function MarkdownCodeBlock({
           />
         </span>
         <span className="flex items-center gap-0.5" role="toolbar" aria-label="Code block actions">
-          {mermaidToggle ? (
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    className="chat-markdown-chrome-action"
-                    aria-pressed={mermaidToggle.showingSource}
-                    onClick={mermaidToggle.onToggle}
-                    aria-label={toggleLabel}
-                  />
-                }
-              >
-                {mermaidToggle.showingSource ? (
-                  <WorkflowIcon className="size-3" />
-                ) : (
-                  <CodeIcon className="size-3" />
-                )}
-              </TooltipTrigger>
-              <TooltipPopup side="top">{toggleLabel}</TooltipPopup>
-            </Tooltip>
-          ) : null}
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="chat-markdown-chrome-action"
-                  aria-pressed={wrapped}
-                  onClick={() => setWrapped((value) => !value)}
-                  aria-label={wrapLabel}
-                />
-              }
-            >
-              <WrapTextIcon className="size-3" />
-            </TooltipTrigger>
-            <TooltipPopup side="top">{wrapLabel}</TooltipPopup>
-          </Tooltip>
+          {actions.map((action) => {
+            switch (action) {
+              case "mermaid-size":
+                if (!mermaid) return null;
+                return (
+                  <Tooltip key={action}>
+                    <TooltipTrigger
+                      render={
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          className="chat-markdown-chrome-action"
+                          aria-pressed={mermaid.sizeMode === "natural"}
+                          onClick={() =>
+                            mermaid.onSizeModeChange(mermaid.sizeMode === "fit" ? "natural" : "fit")
+                          }
+                          aria-label={sizeLabel}
+                        />
+                      }
+                    >
+                      {mermaid.sizeMode === "natural" ? (
+                        <ShrinkIcon className="size-3" />
+                      ) : (
+                        <UnfoldHorizontalIcon className="size-3" />
+                      )}
+                    </TooltipTrigger>
+                    <TooltipPopup side="top">{sizeLabel}</TooltipPopup>
+                  </Tooltip>
+                );
+              case "wrap":
+                return (
+                  <Tooltip key={action}>
+                    <TooltipTrigger
+                      render={
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          className="chat-markdown-chrome-action"
+                          aria-pressed={wrapped}
+                          onClick={() => setWrapped((value) => !value)}
+                          aria-label={wrapLabel}
+                        />
+                      }
+                    >
+                      <WrapTextIcon className="size-3" />
+                    </TooltipTrigger>
+                    <TooltipPopup side="top">{wrapLabel}</TooltipPopup>
+                  </Tooltip>
+                );
+              case "mermaid-toggle":
+                if (!mermaid) return null;
+                return (
+                  <Tooltip key={action}>
+                    <TooltipTrigger
+                      render={
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          className="chat-markdown-chrome-action"
+                          aria-pressed={mermaid.mode === "source"}
+                          onClick={mermaid.onToggleMode}
+                          aria-label={toggleLabel}
+                        />
+                      }
+                    >
+                      {mermaid.mode === "diagram" ? (
+                        <CodeIcon className="size-3" />
+                      ) : (
+                        <WorkflowIcon className="size-3" />
+                      )}
+                    </TooltipTrigger>
+                    <TooltipPopup side="top">{toggleLabel}</TooltipPopup>
+                  </Tooltip>
+                );
+            }
+          })}
           <Tooltip>
             <TooltipTrigger
               render={

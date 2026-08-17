@@ -171,3 +171,19 @@ describe("mermaidRenderCacheKey", () => {
     );
   });
 });
+
+describe("mermaidSourceKey", () => {
+  it("produces the same key regardless of theme, unlike mermaidRenderCacheKey", async () => {
+    const { mermaidRenderCacheKey, mermaidSourceKey } = await import("./mermaidRenderer");
+    const source = uniqueSource();
+
+    expect(mermaidSourceKey(source)).toBe(mermaidSourceKey(source));
+    expect(mermaidRenderCacheKey(source, "light")).not.toBe(mermaidRenderCacheKey(source, "dark"));
+  });
+
+  it("produces a different key for different sources", async () => {
+    const { mermaidSourceKey } = await import("./mermaidRenderer");
+
+    expect(mermaidSourceKey(uniqueSource())).not.toBe(mermaidSourceKey(uniqueSource()));
+  });
+});

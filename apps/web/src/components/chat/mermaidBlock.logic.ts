@@ -117,22 +117,146 @@ export function resolveMermaidView(input: {
   }
 }
 
+/** `fit` relies on mermaid's own root `<svg width="100%">` presentation
+ * attribute — any CSS `width` beats a presentation attribute, so leaving it
+ * alone is what makes fit work today. `natural` has to override that
+ * attribute itself with an explicit CSS `width`, then leans on the
+ * container scrolling both axes (capped in height) instead. */
+export type MermaidSizeMode = "fit" | "natural";
+
+/** Custom property `mermaidDiagramClassName`'s natural-mode width reads
+ * from; `MermaidBlock` sets it inline from `parseMermaidNaturalWidth`. */
+export const MERMAID_NATURAL_WIDTH_CSS_VAR = "--mermaid-natural-width";
+
+const MERMAID_DIAGRAM_BASE_CLASS_NAME = "chat-markdown-mermaid-diagram p-3 [&_svg]:h-auto";
+
 /**
- * Whether the header's source/diagram toggle should render at all.
- *
- * The toggle is only honest once a diagram actually exists to switch
- * to — `renderState.status === "rendered"` covers both directions: while
- * `prefersSource` is false it offers the way to source, and once the user
- * has switched to source (`prefersSource` true) it still offers the way
- * back, because `renderState` does not change when the user's preference
- * does. Before a diagram exists — fence still open, still pending, or the
- * render failed — there is nothing to toggle to, so the control does not
- * appear; an open fence, a pending render, and a failed render all already
- * fall through to the code block (or the code block plus an error message)
- * on their own.
+ * `fit`: mermaid's own `width="100%"` presentation attribute already fits
+ * the diagram to its container, so this leaves the svg alone and scrolls
+ * horizontally only, exactly as before. `natural`: a CSS `width` beats that
+ * attribute, so this sets one from `MERMAID_NATURAL_WIDTH_CSS_VAR` (with a
+ * `100%` fallback, so a block whose natural width couldn't be parsed
+ * degrades to fit instead of collapsing to the SVG default replaced-element
+ * size). It also force-lifts mermaid's own inline `max-width` — being an
+ * inline style, only an `!important` rule can override it — so a wide
+ * diagram in a wide container isn't still held to the cap mermaid computed
+ * for itself. Since the SVG keeps its own aspect ratio (`[&_svg]:h-auto`
+ * above), a wide diagram is also a tall one, so natural mode caps the
+ * container's own height and scrolls both axes instead of stretching the
+ * chat message to the diagram's full height.
  */
-export function hasMermaidDiagramToggle(renderState: MermaidRenderState): boolean {
-  return renderState.status === "rendered";
+export function mermaidDiagramClassName(sizeMode: MermaidSizeMode): string {
+  if (sizeMode === "fit") {
+    return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} overflow-x-auto [&_svg]:max-w-full`;
+  }
+  // Tailwind scans source text without executing it, so this custom property
+  // name must be written literally here, not interpolated from
+  // `MERMAID_NATURAL_WIDTH_CSS_VAR` — an interpolated class produces no rule.
+  // It appears twice on purpose: keep this copy in sync with the constant.
+  return `${MERMAID_DIAGRAM_BASE_CLASS_NAME} overflow-auto max-h-[70vh] [&_svg]:max-w-none! [&_svg]:w-[var(--mermaid-natural-width,100%)]`;
+}
+
+/** How far into a rendered SVG string to look for the root `<svg>` tag's
+ * attributes. Real mermaid output puts them well within this, and reading
+ * only the head keeps this parser out of the business of scanning a whole
+ * (possibly large) diagram body. */
+const SVG_HEAD_LENGTH = 2048;
+
+/** Mermaid's own inline cap: `style="...max-width: 1705.03125px;..."` on the
+ * root svg. Checked first since it is already the exact pixel figure mermaid
+ * derived for this diagram. */
+const INLINE_MAX_WIDTH_PATTERN = /<svg\b[^>]*\bstyle="[^"]*max-width:\s*([0-9.]+)px/;
+
+/** Fallback source: the root svg's `viewBox="minX minY width height"`. Used
+ * when a future mermaid config drops the inline cap. */
+const VIEW_BOX_PATTERN = /<svg\b[^>]*\bviewBox="([^"]*)"/;
+
+/**
+ * The diagram's natural CSS width in pixels, read from the head of a
+ * rendered mermaid SVG string — its inline `max-width`, or failing that the
+ * third (width) value of its `viewBox`. `undefined` when neither is present,
+ * or the one found does not parse to a finite, positive number. DOM-free and
+ * string-only so it runs the same in a `node` test environment as in the
+ * browser.
+ */
+export function parseMermaidNaturalWidth(svg: string): number | undefined {
+  const head = svg.slice(0, SVG_HEAD_LENGTH);
+  const inlineMaxWidth = INLINE_MAX_WIDTH_PATTERN.exec(head)?.[1];
+  const viewBox = VIEW_BOX_PATTERN.exec(head)?.[1];
+  const raw = inlineMaxWidth ?? viewBox?.trim().split(/\s+/)[2];
+  if (raw == null) {
+    return undefined;
+  }
+  const width = Number(raw);
+  return Number.isFinite(width) && width > 0 ? width : undefined;
+}
+
+/** Which of the two chrome layouts a mermaid block's header should show —
+ * "diagram" while the user wants to see one (whether or not it has rendered
+ * yet), "source" once they have switched away from it. Unlike `MermaidView`,
+ * this tracks the user's preference rather than render progress, which is
+ * what keeps the toggle from flickering while a render is in flight; see
+ * `resolveMermaidPresentation`. */
+export type MermaidChromeMode = "diagram" | "source";
+
+/** The header actions `MarkdownCodeBlock` renders before the always-present
+ * copy button, and in the order they render. No chrome mode (an ordinary
+ * code block, or a mermaid block with nothing to toggle to) keeps today's
+ * wrap-lines-only chrome. Diagram mode shows the fit/natural size toggle in
+ * place of wrap-lines, but only once `diagramVisible` — an SVG is actually
+ * on screen; a diagram-preferred block still waiting on its render has
+ * nothing to size yet, so it keeps wrap-lines like source mode does. */
+export type MarkdownCodeBlockAction = "wrap" | "mermaid-size" | "mermaid-toggle";
+
+export function markdownCodeBlockActions(
+  mermaidMode: MermaidChromeMode | undefined,
+  diagramVisible: boolean,
+): ReadonlyArray<MarkdownCodeBlockAction> {
+  if (!mermaidMode) {
+    return ["wrap"];
+  }
+  return mermaidMode === "diagram" && diagramVisible
+    ? ["mermaid-size", "mermaid-toggle"]
+    : ["wrap", "mermaid-toggle"];
+}
+
+/**
+ * What a mermaid block shows, and which chrome mode its header uses, as one
+ * function of the three inputs that decide both: the persisted render
+ * preference, the render's progress, and whether the fence has closed.
+ *
+ * `renderMermaidPreferred` is the raw stored value ("should this render as a
+ * diagram"); inverting it into `prefersSource` here, rather than at the call
+ * site, is what puts that inversion under test instead of leaving it as an
+ * untested inline expression.
+ *
+ * `chromeMode` is absent (no chrome at all) only while the fence is still
+ * open — nothing has streamed in to toggle yet — or once a diagram-preferred
+ * render has permanently failed, since the failure view already shows the
+ * source with no diagram to offer switching back to. Every other case gets a
+ * `chromeMode`, including a diagram-preferred render that is still pending:
+ * the toggle stays put and only its label changes once the SVG lands,
+ * instead of appearing or disappearing out from under the user's cursor.
+ */
+export function resolveMermaidPresentation(input: {
+  readonly renderMermaidPreferred: boolean;
+  readonly renderState: MermaidRenderState;
+  readonly fenceClosed: boolean;
+}): {
+  readonly view: MermaidView;
+  readonly prefersSource: boolean;
+  readonly chromeMode?: MermaidChromeMode;
+} {
+  const prefersSource = !input.renderMermaidPreferred;
+  const view = resolveMermaidView({
+    prefersSource,
+    renderState: input.renderState,
+    fenceClosed: input.fenceClosed,
+  });
+  if (!input.fenceClosed || (!prefersSource && input.renderState.status === "failed")) {
+    return { view, prefersSource };
+  }
+  return { view, prefersSource, chromeMode: prefersSource ? "source" : "diagram" };
 }
 
 /** Pulls a human-readable message out of whatever a render rejected with.

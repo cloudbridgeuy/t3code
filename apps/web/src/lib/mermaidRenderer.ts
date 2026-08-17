@@ -100,6 +100,13 @@ export function mermaidRenderCacheKey(source: string, theme: "light" | "dark"): 
   return `${fnv1a32(source).toString(36)}:${source.length}:${theme}`;
 }
 
+/** Same hash as `mermaidRenderCacheKey`, without the theme — for per-diagram
+ * state that should survive a theme switch instead of resetting, like which
+ * diagrams the user has expanded to natural size. */
+export function mermaidSourceKey(source: string): string {
+  return `${fnv1a32(source).toString(36)}:${source.length}`;
+}
+
 /** Synchronous cache lookup, for seeding a component's initial render state
  * without waiting on the async `renderMermaidDiagram` path. `LRUCache.get`
  * returns `null` on a miss; converted to `undefined` here so this keeps its
