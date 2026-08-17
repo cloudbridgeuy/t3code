@@ -25,6 +25,7 @@ import React, {
   Suspense,
   type ClipboardEvent as ReactClipboardEvent,
   type MouseEvent as ReactMouseEvent,
+  createContext,
   isValidElement,
   use,
   useCallback,
@@ -35,7 +36,7 @@ import React, {
   useState,
   type ReactNode,
 } from "react";
-import type { Components, Options as ReactMarkdownOptions } from "react-markdown";
+import type { Components, ExtraProps, Options as ReactMarkdownOptions } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import { defaultUrlTransform } from "react-markdown";
 import rehypeRaw from "rehype-raw";
@@ -1149,6 +1150,89 @@ function areMarkdownFileLinkPropsEqual(
   );
 }
 
+/** Values `MarkdownPre` needs from `ChatMarkdown`'s scope. See `MarkdownPre` for why these travel
+ * through context instead of a closure. */
+interface MarkdownPreContextValue {
+  diffThemeName: DiffThemeName;
+  isStreaming: boolean;
+  resolvedTheme: "light" | "dark";
+  text: string;
+}
+
+// `ChatMarkdown` always renders `MarkdownPreContext.Provider` around its `<ReactMarkdown>`, so
+// `MarkdownPre` never reads this default — it exists only to satisfy `createContext`, matching the
+// `TimelineRowCtx`/`TimelineRowActivityCtx` pattern in MessagesTimeline.tsx.
+const MarkdownPreContext = createContext<MarkdownPreContextValue>(null!);
+
+/**
+ * `ReactMarkdown`'s `components.pre` renderer, lifted out of the `markdownComponents` `useMemo`
+ * (below) to a stable, module-level component. That memo is keyed on `text` — the streaming
+ * message body — so it recomputes on every provider token, and an inline `pre` handler defined
+ * inside it would get a new function identity every token. `react-markdown` would then hand React
+ * a *different component type* for the same `<pre>` on every render, and React cannot reconcile
+ * across a changed element type: it unmounts and remounts the whole code-block subtree —
+ * including `MermaidBlock` and the Shiki-highlighted block — once per streamed token for the rest
+ * of the turn. `MermaidBlock`'s module-level `seenNearViewport` and `naturalSizeMermaidDiagrams`
+ * sets, its localStorage-backed mode, and `mermaidRenderer.ts`'s in-flight render de-duplication
+ * all exist to survive that remount, and still matter for `LegendList` row recycling (which
+ * remounts rows independently of streaming), so none of that machinery goes away here.
+ *
+ * `MarkdownPre` being declared once at module scope means `react-markdown` sees the same
+ * component type on every render regardless of how often `markdownComponents` itself is rebuilt —
+ * React compares each child's type, not the identity of the map it came from. The values this
+ * component used to close over (`diffThemeName`, `isStreaming`, `resolvedTheme`, `text`) still
+ * change every token, so they arrive through `MarkdownPreContext` instead of a closure. A changed
+ * context value re-renders a consumer; it does not remount it. That distinction — re-render
+ * instead of remount — is the entire point of this component living here.
+ */
+function MarkdownPre({ node, children, ...props }: React.ComponentProps<"pre"> & ExtraProps) {
+  const { diffThemeName, isStreaming, resolvedTheme, text } = use(MarkdownPreContext);
+  const codeBlock = extractCodeBlock(children);
+  if (!codeBlock) {
+    return <pre {...props}>{children}</pre>;
+  }
+
+  const language = extractFenceLanguage(codeBlock.className);
+  const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
+  const shikiElement = (
+    <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
+      <Suspense fallback={<pre {...props}>{children}</pre>}>
+        <SuspenseShikiCodeBlock
+          className={codeBlock.className}
+          code={codeBlock.code}
+          themeName={diffThemeName}
+          isStreaming={isStreaming}
+        />
+      </Suspense>
+    </RenderErrorBoundary>
+  );
+
+  if (isMermaidFence(language)) {
+    return (
+      <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
+        <MermaidBlock
+          source={codeBlock.code}
+          fenceTitle={fenceTitle}
+          theme={resolvedTheme}
+          sourceView={shikiElement}
+          fenceClosed={isFenceClosed(text, node?.position, isStreaming)}
+        />
+      </RenderErrorBoundary>
+    );
+  }
+
+  return (
+    <MarkdownCodeBlock
+      code={codeBlock.code}
+      language={language}
+      fenceTitle={fenceTitle}
+      theme={resolvedTheme}
+    >
+      {shikiElement}
+    </MarkdownCodeBlock>
+  );
+}
+
 function ChatMarkdown({
   text,
   cwd,
@@ -1480,59 +1564,12 @@ function ChatMarkdown({
       details({ node: _node, children, open: detailsOpen }) {
         return <MarkdownDetails open={detailsOpen}>{children}</MarkdownDetails>;
       },
-      pre({ node, children, ...props }) {
-        const codeBlock = extractCodeBlock(children);
-        if (!codeBlock) {
-          return <pre {...props}>{children}</pre>;
-        }
-
-        const language = extractFenceLanguage(codeBlock.className);
-        const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
-        const shikiElement = (
-          <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
-            <Suspense fallback={<pre {...props}>{children}</pre>}>
-              <SuspenseShikiCodeBlock
-                className={codeBlock.className}
-                code={codeBlock.code}
-                themeName={diffThemeName}
-                isStreaming={isStreaming}
-              />
-            </Suspense>
-          </RenderErrorBoundary>
-        );
-
-        if (isMermaidFence(language)) {
-          return (
-            <RenderErrorBoundary fallback={<pre {...props}>{children}</pre>}>
-              <MermaidBlock
-                source={codeBlock.code}
-                fenceTitle={fenceTitle}
-                theme={resolvedTheme}
-                sourceView={shikiElement}
-                fenceClosed={isFenceClosed(text, node?.position, isStreaming)}
-              />
-            </RenderErrorBoundary>
-          );
-        }
-
-        return (
-          <MarkdownCodeBlock
-            code={codeBlock.code}
-            language={language}
-            fenceTitle={fenceTitle}
-            theme={resolvedTheme}
-          >
-            {shikiElement}
-          </MarkdownCodeBlock>
-        );
-      },
+      pre: MarkdownPre,
     };
   }, [
     cwd,
-    diffThemeName,
     fileLinkParentSuffixByPath,
     inlineCodeFileLinkMetaByText,
-    isStreaming,
     markdownFileLinkMetaByHref,
     onTaskListChange,
     openInPreferredEditor,
@@ -1544,6 +1581,12 @@ function ChatMarkdown({
     threadRef,
   ]);
   /* eslint-enable react/no-unstable-nested-components */
+  // Rebuilt every token along with `markdownComponents` (both are keyed on `text`), but consumed
+  // by `MarkdownPre` through context rather than a closure — see that component for why.
+  const markdownPreContextValue = useMemo<MarkdownPreContextValue>(
+    () => ({ diffThemeName, isStreaming, resolvedTheme, text }),
+    [diffThemeName, isStreaming, resolvedTheme, text],
+  );
 
   return (
     <div
@@ -1553,16 +1596,18 @@ function ChatMarkdown({
       )}
       onCopy={handleCopy}
     >
-      <ReactMarkdown
-        remarkPlugins={
-          lineBreaks ? CHAT_MARKDOWN_REMARK_PLUGINS_WITH_BREAKS : CHAT_MARKDOWN_REMARK_PLUGINS
-        }
-        rehypePlugins={CHAT_MARKDOWN_REHYPE_PLUGINS}
-        components={markdownComponents}
-        urlTransform={markdownUrlTransform}
-      >
-        {text}
-      </ReactMarkdown>
+      <MarkdownPreContext.Provider value={markdownPreContextValue}>
+        <ReactMarkdown
+          remarkPlugins={
+            lineBreaks ? CHAT_MARKDOWN_REMARK_PLUGINS_WITH_BREAKS : CHAT_MARKDOWN_REMARK_PLUGINS
+          }
+          rehypePlugins={CHAT_MARKDOWN_REHYPE_PLUGINS}
+          components={markdownComponents}
+          urlTransform={markdownUrlTransform}
+        >
+          {text}
+        </ReactMarkdown>
+      </MarkdownPreContext.Provider>
     </div>
   );
 }
