@@ -172,6 +172,49 @@ describe("mermaidRenderCacheKey", () => {
   });
 });
 
+describe("ensureInitialized options", () => {
+  // `ensureInitialized` only calls `mermaid.initialize` once per resolved
+  // theme (a module-level `initializedTheme` guard) — `vi.resetModules`
+  // before each case clears that guard along with every other module-level
+  // cache, so every case here is guaranteed a fresh `initialize` call
+  // regardless of what an earlier `describe` block already rendered. Mock
+  // call history is cleared separately since resetModules only replaces the
+  // renderer's own module state, not the shared `vi.fn()`s it calls into.
+  beforeEach(() => {
+    vi.resetModules();
+    initialize.mockClear();
+    parse.mockClear();
+    render.mockClear();
+  });
+
+  it("passes the app font, suppresses mermaid's own error graphic, and silences non-fatal logging", async () => {
+    const { renderMermaidDiagram } = await import("./mermaidRenderer");
+    await renderMermaidDiagram(uniqueSource(), "light");
+
+    expect(initialize).toHaveBeenCalledTimes(1);
+    expect(initialize).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fontFamily: "var(--font-sans)",
+        suppressErrorRendering: true,
+        logLevel: "fatal",
+      }),
+    );
+  });
+
+  it("still passes the existing startOnLoad, securityLevel, and theme options", async () => {
+    const { renderMermaidDiagram } = await import("./mermaidRenderer");
+    await renderMermaidDiagram(uniqueSource(), "dark");
+
+    expect(initialize).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "dark",
+      }),
+    );
+  });
+});
+
 describe("mermaidSourceKey", () => {
   it("produces the same key regardless of theme, unlike mermaidRenderCacheKey", async () => {
     const { mermaidRenderCacheKey, mermaidSourceKey } = await import("./mermaidRenderer");

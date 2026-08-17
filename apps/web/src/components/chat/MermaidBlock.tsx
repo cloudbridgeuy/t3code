@@ -10,6 +10,7 @@ import {
   renderMermaidDiagram,
 } from "../../lib/mermaidRenderer";
 import {
+  buildMermaidCopyFence,
   MERMAID_NATURAL_WIDTH_CSS_VAR,
   mermaidDiagramClassName,
   mermaidFailureMessage,
@@ -211,6 +212,17 @@ export function MermaidBlock({
         <div
           className={mermaidDiagramClassName(sizeMode)}
           {...mermaidDiagramStyleProps}
+          // Without this, copying a message containing this block would
+          // drop it silently: `markdown-clipboard.ts` skips every `<svg>`
+          // (untrusted mermaid output isn't safe to hand to a rich-paste
+          // target), and this div's only child is one — so the serializer
+          // would otherwise walk in, hit the svg, and contribute nothing.
+          // Set here (not on the Failed or Source views below) because
+          // those already round-trip on their own: `sourceView` is a plain
+          // `<pre>`, which the serializer's generic code-block branch
+          // already reconstructs correctly from `data-language` and text
+          // content, with no diagram markup in the way.
+          data-markdown-copy={buildMermaidCopyFence(source)}
           // Safe against untrusted diagram text — mermaid sanitizes its own
           // SVG output at `securityLevel: "strict"`; see mermaidRenderer.ts.
           dangerouslySetInnerHTML={{ __html: view.svg }}
