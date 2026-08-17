@@ -231,9 +231,16 @@ describe("mermaidDiagramClassName", () => {
     expect(className).toContain(`var(${MERMAID_NATURAL_WIDTH_CSS_VAR}`);
   });
 
-  it("keeps the horizontal scroll container in both modes", () => {
-    expect(mermaidDiagramClassName("fit")).toContain("overflow-x-auto");
-    expect(mermaidDiagramClassName("natural")).toContain("overflow-x-auto");
+  it("scrolls horizontally only in fit mode, and on both axes with a height cap in natural mode", () => {
+    const fitClassName = mermaidDiagramClassName("fit");
+    expect(fitClassName).toContain("overflow-x-auto");
+    expect(fitClassName).not.toContain("overflow-auto");
+    expect(fitClassName).not.toContain("max-h-");
+
+    const naturalClassName = mermaidDiagramClassName("natural");
+    expect(naturalClassName).toContain("overflow-auto");
+    expect(naturalClassName).not.toContain("overflow-x-auto");
+    expect(naturalClassName).toContain("max-h-[70vh]");
   });
 });
 
