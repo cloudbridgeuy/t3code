@@ -263,6 +263,57 @@ export function resolveMermaidPresentation(input: {
   return { view, prefersSource, chromeMode: prefersSource ? "source" : "diagram" };
 }
 
+/** Longest run of 3-or-more backticks anywhere in `text` — mirrors
+ * `codeFenceFor` in `markdown-clipboard.ts`, which this exists alongside: a
+ * fence has to out-length any backtick run it encloses (CommonMark), and a
+ * mermaid diagram's own source text is exactly the kind of untrusted content
+ * that could contain one (a label quoting a code span, for instance). Runs
+ * shorter than 3 are ignored because they can never conflict with a fence,
+ * whose minimum length is already 3. */
+function longestBacktickRun(text: string): number {
+  return [...(text.match(/`{3,}/g) ?? [])].reduce((max, run) => Math.max(max, run.length), 0);
+}
+
+/**
+ * Rebuilds the ```mermaid fence for `source` as it would have been written,
+ * for `MermaidBlock`'s rendered-diagram view to carry as its
+ * `data-markdown-copy` value — otherwise copying a message that contains a
+ * rendered diagram silently drops it, since the injected `<svg>` has no
+ * markdown source of its own for the clipboard serializer to fall back to.
+ *
+ * The fence length grows past any backtick run inside `source` the same way
+ * `codeFenceFor` does for an ordinary code block, so a diagram whose text
+ * itself contains a ```` ``` ```` run still round-trips instead of closing
+ * early. The trailing blank line after the closing fence matches how
+ * `serializeCodeBlock` separates a fenced block from whatever follows it.
+ *
+ * `source` is stripped of one trailing `\n` before any of that, because that
+ * trailing newline is never author intent: `MermaidBlock`'s `source` prop is
+ * `codeBlock.code`, which comes from `ChatMarkdown`'s `extractCodeBlock` via
+ * `nodeToPlainText`, and that text was produced by `mdast-util-to-hast`'s
+ * `code` handler, which does `node.value + '\n'` unconditionally for every
+ * non-empty fence. So `source` here always ends in exactly one `\n`
+ * regardless of what the fence's author wrote, and reconstructing that
+ * newline verbatim would add a spurious blank line before the closing fence
+ * on every single copy. `serializeCodeBlock` strips the same trailing
+ * newline off `pre.textContent` for the identical reason; stripping it here
+ * too is what keeps this function's output byte-identical to what
+ * `serializeCodeBlock` would produce for the same fence in source mode.
+ *
+ * Deliberately does not reconstruct a fence title (```` ```mermaid
+ * title="x" ```` / `file="x"` / a bare filename token — `ChatMarkdown`'s
+ * `extractFenceTitle` accepts all three): the resolved title string alone
+ * doesn't say which syntax produced it, and the ordinary code block's own
+ * copy path (`serializeCodeBlock` in markdown-clipboard.ts) already drops
+ * title on copy the same way, reconstructing only fence and language — so
+ * this matches that existing precedent rather than guessing at a syntax.
+ */
+export function buildMermaidCopyFence(source: string): string {
+  const code = source.replace(/\n$/, "");
+  const fence = "`".repeat(Math.max(3, longestBacktickRun(code) + 1));
+  return `${fence}mermaid\n${code}\n${fence}\n\n`;
+}
+
 /** Pulls a human-readable message out of whatever a render rejected with.
  * `Error` values read as their `.message`; anything else (a thrown string,
  * a rejected non-Error) is coerced so a failure never surfaces as

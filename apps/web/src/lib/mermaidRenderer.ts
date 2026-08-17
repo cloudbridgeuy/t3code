@@ -53,6 +53,17 @@ function ensureInitialized(mermaid: Mermaid, theme: "light" | "dark"): void {
     // diagram text.
     securityLevel: "strict",
     theme: mermaidThemeFor(theme),
+    // Matches the app's own font instead of mermaid's default.
+    fontFamily: "var(--font-sans)",
+    // `parse()` above already turns a syntax error into a "failed" value
+    // without ever calling `render()`; this covers the remaining case where
+    // `parse()` passes but `render()` itself throws, so mermaid never
+    // injects its own error graphic into the document behind our back.
+    suppressErrorRendering: true,
+    // A failed render is a normal outcome for streaming, agent-authored
+    // diagram text, not a real error — this keeps mermaid from logging one
+    // to the console on every such failure.
+    logLevel: "fatal",
   });
   initializedTheme = theme;
 }

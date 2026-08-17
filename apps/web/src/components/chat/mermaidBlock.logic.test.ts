@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  buildMermaidCopyFence,
   isFenceClosed,
   isMermaidFence,
   markdownCodeBlockActions,
@@ -281,6 +282,69 @@ describe("parseMermaidNaturalWidth", () => {
   it("returns undefined for a non-positive inline max-width", () => {
     const svg = svgHead('style="max-width: 0px;" viewBox="0 0 500 300" width="100%"');
     expect(parseMermaidNaturalWidth(svg)).toBeUndefined();
+  });
+});
+
+describe("buildMermaidCopyFence", () => {
+  it("wraps a diagram with no trailing newline in a ```mermaid fence (a shape that never occurs in production)", () => {
+    const source = "graph TD\n  A --> B";
+    expect(buildMermaidCopyFence(source)).toBe("```mermaid\ngraph TD\n  A --> B\n```\n\n");
+  });
+
+  it("strips the trailing newline mdast-util-to-hast adds to every fence", () => {
+    // `MermaidBlock`'s `source` prop always ends in exactly one `\n` —
+    // appended unconditionally by mdast-util-to-hast's `code` handler
+    // (`node.value + '\n'`), not written by the diagram's author. Keeping
+    // that newline would add a spurious blank line before the closing
+    // fence on every single copy, so it must be stripped before rebuilding.
+    const source = "graph TD\n  A --> B\n";
+    expect(buildMermaidCopyFence(source)).toBe("```mermaid\ngraph TD\n  A --> B\n```\n\n");
+  });
+
+  it("recovers the human-authored fence content from the realistic (trailing-newline) input shape", () => {
+    // `source` here is exactly what `MermaidBlock` always actually
+    // receives: the human-authored code plus the one `\n` hast appends.
+    // Stripping that appended newline before building must recover the
+    // human-authored code itself, not the hast-augmented string.
+    const code = "graph TD\n  A --> B";
+    const fenced = buildMermaidCopyFence(`${code}\n`);
+    const recovered = /^```mermaid\n([\s\S]*)\n```\n\n$/.exec(fenced)?.[1];
+    expect(recovered).toBe(code);
+  });
+
+  it("matches serializeCodeBlock's output shape for the same fence in source mode", () => {
+    // `serializeCodeBlock` (markdown-clipboard.ts:66-70) does
+    // `code = pre.textContent.replace(/\n$/, "")` and then returns
+    // `${fence}${language}\n${code}\n${fence}\n\n` — for a `<pre>` whose
+    // resolved language is "mermaid" and whose `textContent` is
+    // `code + "\n"` (the shape every real `<pre>` has), that is exactly
+    // this string. These two paths must stay in step, or copying the same
+    // fence in source mode vs. diagram mode produces different markdown.
+    const code = "graph TD\n  A --> B";
+    const fence = "```";
+    expect(buildMermaidCopyFence(`${code}\n`)).toBe(`${fence}mermaid\n${code}\n${fence}\n\n`);
+  });
+
+  it("grows the fence past a triple-backtick run inside the source", () => {
+    // CommonMark requires the fence to be longer than any backtick run it
+    // encloses, and the closing fence to be at least as long as the
+    // opener — a diagram whose text quotes a code span (e.g. a node label
+    // like `` `A["```js``` "]` ``) is exactly this case for mermaid's own
+    // source, which is untrusted, streamed, agent-authored text. Uses the
+    // realistic trailing-newline shape, since that is the only one
+    // `MermaidBlock` ever passes in production.
+    const code = 'flowchart TD\n  A["```js\nconst x = 1\n```"]';
+    const fenced = buildMermaidCopyFence(`${code}\n`);
+    expect(fenced.startsWith("````mermaid\n")).toBe(true);
+    expect(fenced.endsWith("\n````\n\n")).toBe(true);
+    expect(fenced).toContain(code);
+  });
+
+  it("grows the fence past a run longer than three backticks", () => {
+    const source = "flowchart TD\n  A[`````not really code`````]";
+    const fenced = buildMermaidCopyFence(source);
+    expect(fenced.startsWith("``````mermaid\n")).toBe(true);
+    expect(fenced.endsWith("\n``````\n\n")).toBe(true);
   });
 });
 
